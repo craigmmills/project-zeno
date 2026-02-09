@@ -30,11 +30,11 @@ For detailed technical architecture, see [Agent Architecture Documentation](docs
 To enable that, the project relies on a set of services being deployed with it.
 
 - eoAPI to provide access to the LCL data in a STAC catalog and serving tiles
-- Langfuse for tracing of the agent interactions
-- PostgreSQL for the API data and geographic search of AOIs
+- Langfuse for tracing of the agent interactions (optional for local development)
+- PostgreSQL with PostGIS for the API data and geographic search of AOIs
 - FastAPI deployment for the API
 
-All these services are being managed and deployed throug our deploy
+All these services are being managed and deployed through our deploy
 repository at [project-zeno-deploy](https://github.com/wri/project-zeno-deploy)
 
 ### Frontend
@@ -54,121 +54,179 @@ for STAC can be found in the [gnw-stac](https://github.com/wri/gnw-stac) reposit
 
 ## Dependencies
 
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- [postgresql](https://www.postgresql.org/) (for using local DB instead of docker)
-- [docker](https://docs.docker.com/)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) - Python package manager
+- [docker](https://docs.docker.com/) - For running PostgreSQL locally
+
+## Quick Start
+
+```bash
+# 1. Clone and install dependencies
+git clone git@github.com:wri/project-zeno.git
+cd project-zeno
+uv sync
+
+# 2. Setup environment files (see Environment Configuration below)
+cp .env.example .env
+# Create .env.local with your API keys and local overrides
+
+# 3. Start infrastructure and run migrations
+make up
+cd db && uv run alembic upgrade head && cd ..
+
+# 4. Build dataset embeddings (requires GOOGLE_API_KEY)
+mkdir -p data
+uv run python src/ingest/embed_datasets.py
+
+# 5. Ingest geographic data (optional but recommended, ~2.5GB download)
+uv run python src/ingest/ingest_gadm.py
+
+# 6. Start the application
+make api      # Terminal 1: API on http://localhost:8000
+make frontend # Terminal 2: Frontend on http://localhost:8501
+```
 
 ## Local Development Setup
 
-We use uv for package management and docker-compose
-for running the sytem locally.
+### 1. Clone and install dependencies
 
-1. **Clone and setup:**
+```bash
+git clone git@github.com:wri/project-zeno.git
+cd project-zeno
+uv sync
+source .venv/bin/activate
+```
 
-   ```bash
-   git clone git@github.com:wri/project-zeno.git
-   cd project-zeno
-   uv sync
-   source .venv/bin/activate
-   ```
+### 2. Environment configuration
 
-2. **Environment configuration:**
+Create your environment files:
 
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API keys and credentials
+```bash
+cp .env.example .env
+```
 
-   cp .env.local.example .env.local
-   # .env.local contains local development overrides (auto-created by make commands)
-   ```
+Then create `.env.local` with your local development overrides. This file takes precedence over `.env`:
 
-3. **Build dataset RAG database:**
+```bash
+# .env.local - Local development overrides
 
-   Our agent uses a RAG database to select datasets. The RAG database
-   can be built locally using
+# Database connection (Docker PostgreSQL)
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/zeno-data
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5434/zeno-data_test
 
-   ```bash
-   uv run python src/ingest/embed_datasets.py
-   ```
+# API Keys (required)
+GOOGLE_API_KEY=your-google-api-key
+ANTHROPIC_API_KEY=your-anthropic-api-key  # Optional, for Sonnet/Haiku
+OPENAI_API_KEY=your-openai-api-key        # Optional, for GPT models
 
-   As an alternative, the current production table can also be
-   retrieved from S3 if you have the corresponding access permissions.
+# Mapbox (required for map visualizations)
+MAPBOX_API_TOKEN=your-mapbox-token
 
-   ```bash
-   aws s3 sync s3://zeno-static-data/ data/
-   ```
+# GFW Data API (required for analytics)
+GFW_DATA_API_KEY=your-gfw-api-key
 
-4. **Start infrastructure services:**
+# Dataset embeddings (must match the generated file name)
+DATASET_EMBEDDINGS_DB=gnw-dataset-index-gemini-v1
 
-   ```bash
-   make up       # Start Docker services (PostgreSQL + Langfuse + ClickHouse)
-   ```
+# Model configuration
+MODEL=gemini-flash
+SMALL_MODEL=gemini-flash
+EOAPI_BASE_URL=https://eoapi.globalnaturewatch.org
 
-5. **Ingest data (required after starting database):**
+# Local service URLs
+API_BASE_URL=http://localhost:8000
+LOCAL_API_BASE_URL=http://localhost:8000
+STREAMLIT_URL=http://localhost:8501
 
-   After starting the database and infrastructure services, you need to ingest the required datasets. Feel free to run all or just the ones you need.
+# Auth settings for local development
+COOKIE_SIGNER_SECRET_KEY=local-dev-secret-key
+ALLOW_PUBLIC_SIGNUPS=true
+ALLOW_ANONYMOUS_CHAT=true
+NEXTJS_API_KEY=local-dev-api-key
 
-   This downloads ~2 GB of data per dataset except for WDPA which is ~10 GB. It's ok to skip WDPA if you don't need it.
+# Langfuse (optional - use fake keys to disable)
+LANGFUSE_SECRET_KEY=fake-secret-key
+LANGFUSE_PUBLIC_KEY=fake-public-key
+LANGFUSE_HOST=http://localhost:3000
+```
 
-   Make sure you're set up with WRI AWS credentials in your `.env` file to access the S3 bucket.
+### 3. Start infrastructure services
 
-   ```bash
-   python src/ingest/ingest_gadm.py
-   python src/ingest/ingest_kba.py
-   python src/ingest/ingest_landmark.py
-   python src/ingest/ingest_wdpa.py
-   ```
+```bash
+make up       # Start Docker services (PostgreSQL on ports 5433/5434)
+```
 
-   See `src/ingest/` directory for details on each ingestion script.
+This starts:
+- PostgreSQL (main database) on port 5433
+- PostgreSQL (test database) on port 5434
 
-6. **Start application services:**
+### 4. Run database migrations
 
-   ```bash
-   make api      # Run API locally (port 8000)
-   make frontend # Run Streamlit frontend (port 8501)
-   ```
+**Important:** Migrations must be run from the `db` directory:
 
-   Or start everything at once (after data ingestion):
+```bash
+cd db
+uv run alembic upgrade head
+cd ..
+```
 
-   ```bash
-   make dev      # Starts API + frontend (requires infrastructure already running)
-   ```
+### 5. Build dataset RAG database
 
-7. **Setup Local Langfuse:**
-   a. Clone the Langfuse repository outside your current project directory
+Our agent uses a RAG database to select datasets. Build it locally (requires `GOOGLE_API_KEY` with Generative AI API enabled):
 
-   ```bash
-   cd ..
-   git clone https://github.com/langfuse/langfuse.git
-   cd langfuse
-   ```
+```bash
+mkdir -p data
+uv run python src/ingest/embed_datasets.py
+```
 
-   b. Start the Langfuse server
+This creates `data/gnw-dataset-index-gemini-v1`.
 
-   ```bash
-   docker compose up -d
-   ```
+As an alternative, the current production table can also be retrieved from S3 if you have the corresponding access permissions:
 
-   c. Access the Langfuse UI at <http://localhost:3000>
-   1. Create an account
-   2. Create a new project
-   3. Copy the API keys from your project settings
+```bash
+aws s3 sync s3://zeno-static-data/ data/
+```
 
-   d. Return to your project directory and update your .env.local file
+### 6. Ingest geographic data
 
-   ```bash
-   cd ../project-zeno
-   # Update these values in your .env.local file:
-   LANGFUSE_HOST=http://localhost:3000
-   LANGFUSE_PUBLIC_KEY=your_public_key_here
-   LANGFUSE_SECRET_KEY=your_secret_key_here
-   ```
+After starting the database, ingest the geographic boundaries for area-of-interest searches:
 
-8. **Access the application:**
+| Dataset | Download Size | Description |
+|---------|--------------|-------------|
+| GADM | ~2.5 GB | Administrative boundaries (countries, states, cities) |
+| KBA | ~2 GB | Key Biodiversity Areas |
+| Landmark | ~2 GB | Indigenous and Community Lands |
+| WDPA | ~10 GB | World Database on Protected Areas |
 
-   - Frontend: <http://localhost:8501>
-   - API: <http://localhost:8000>
-   - Langfuse: <http://localhost:3000>
+```bash
+# GADM is recommended for basic functionality
+uv run python src/ingest/ingest_gadm.py
+
+# Optional - run if you need these specific area types
+uv run python src/ingest/ingest_kba.py
+uv run python src/ingest/ingest_landmark.py
+uv run python src/ingest/ingest_wdpa.py  # Large download, skip if not needed
+```
+
+GADM ingestion downloads a 2.5GB zip file, extracts to a 4.6GB GeoPackage, and loads ~400,000 geographic records into PostGIS.
+
+### 7. Start application services
+
+```bash
+make api      # Run API locally (port 8000)
+make frontend # Run Streamlit frontend (port 8501)
+```
+
+Or start everything at once:
+
+```bash
+make dev      # Starts API + frontend (requires infrastructure already running)
+```
+
+### 8. Access the application
+
+- Frontend: <http://localhost:8501>
+- API: <http://localhost:8000>
+- API Docs: <http://localhost:8000/docs>
 
 ## Development Commands
 
@@ -179,83 +237,84 @@ make down     # Stop Docker infrastructure
 make api      # Run API with hot reload
 make frontend # Run frontend with hot reload
 make dev      # Start full development environment
+make test     # Run tests
+make clean    # Clean up containers and volumes
 ```
 
 ## Testing
 
 ### API Tests
 
-Running `make up` will bring up a `zeno-db_test` database that's used by pytest. The tests look for a `TEST_DATABASE_URL` environment variable (also set in .env.local). You can also create the database manually with the following commands:
-
-```bash
-createuser -s postgres # if you don't have a postgres user
-createdb -U postgres zeno-data_test
-```
-
-Then run the API tests using pytest:
+Running `make up` will bring up a test database on port 5434. The tests look for a `TEST_DATABASE_URL` environment variable.
 
 ```bash
 uv run pytest tests/api/
 ```
 
+## Environment Files
+
+- `.env` - Base configuration (copy from `.env.example`)
+- `.env.local` - Local development overrides (create manually, takes precedence)
+
+The system loads `.env` first, then overrides with `.env.local` for local development.
+
+## Troubleshooting
+
+### "Anonymous chat access is disabled"
+
+Add `ALLOW_ANONYMOUS_CHAT=true` to your `.env.local` file.
+
+### Database connection errors
+
+1. Ensure Docker is running: `docker ps`
+2. Check PostgreSQL is up: `docker compose -f docker-compose.dev.yaml ps`
+3. Verify the port in `DATABASE_URL` matches docker-compose (default: 5433)
+
+### "relation does not exist" errors
+
+Run database migrations:
+```bash
+cd db && uv run alembic upgrade head && cd ..
+```
+
+### Dataset embeddings errors
+
+1. Ensure `GOOGLE_API_KEY` is set and has Generative AI API enabled
+2. Ensure `DATASET_EMBEDDINGS_DB=gnw-dataset-index-gemini-v1` is in `.env.local`
+3. Check that `data/gnw-dataset-index-gemini-v1` exists
+
+### Langfuse connection errors
+
+Langfuse is optional for local development. To disable the warnings, ensure these are in `.env.local`:
+```
+LANGFUSE_SECRET_KEY=fake-secret-key
+LANGFUSE_PUBLIC_KEY=fake-public-key
+```
+
+## Optional: Local Langfuse Setup
+
+For tracing agent interactions locally:
+
+1. Clone and start Langfuse:
+   ```bash
+   cd ..
+   git clone https://github.com/langfuse/langfuse.git
+   cd langfuse
+   docker compose up -d
+   ```
+
+2. Access Langfuse at <http://localhost:3000>
+   - Create an account
+   - Create a new project
+   - Copy the API keys
+
+3. Update your `.env.local`:
+   ```bash
+   LANGFUSE_HOST=http://localhost:3000
+   LANGFUSE_PUBLIC_KEY=pk-lf-your-public-key
+   LANGFUSE_SECRET_KEY=sk-lf-your-secret-key
+   ```
+
 ## CLI User Management
 
 For user administration commands (making users admin, whitelisting emails), see [CLI Documentation](docs/CLI.md).
-
-## Environment Files
-
-- `.env` - Base configuration (production settings)
-- `.env.local` - Local development overrides (auto-created)
-
-The system automatically loads `.env` first, then overrides with `.env.local` for local development.
-
-```bash
-uv run streamlit run src/frontend/app.py
-```
-
-## Setup Database
-
-1. Using docker:
-
-   ```bash
-   docker compose up -d
-   uv run streamlit run frontend/app.py
-   ```
-
-2. Using postgresql:
-
-   a. Create a new database
-
-   ```bash
-   createuser -s postgres # if you don't have a postgres user
-   createdb -U postgres zeno-data-local
-   alembic upgrade head
-
-   # Check if you have the database running
-   psql zeno-data-local
-
-   # Check if you have the tables created
-   \dt
-
-   # Output
-   #               List of relations
-   #  Schema |      Name       | Type  |  Owner
-   # --------+-----------------+-------+----------
-   #  public | alembic_version | table | postgres
-   #  public | threads         | table | postgres
-   #  public | users           | table | postgres
-   ```
-
-   b. Add the database URL to the .env file:
-
-   ```bash
-   DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/zeno-data-local
-   ```
-
-## Configure localhost Langfuse
-
-1. `docker compose up langfuse-server` (or just spin up the whole backend with `docker compose up`)
-2. Open your browser and navigate to <http://localhost:3000> to create a Langfuse account.
-3. Within the Langfuse UI, create an organization and then a project.
-4. Copy the API keys (public and secret) generated for your project.
-5. Update the `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` environment variables in your `docker-compose.yml` file with the copied keys.

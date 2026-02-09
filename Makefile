@@ -68,7 +68,7 @@ api: ## Run API locally
 frontend: ## Run frontend locally
 	@echo "🎨 Starting frontend locally..."
 	@echo "📄 Using .env + .env.local for configuration"
-	@uv run streamlit run src/frontend/app.py --server.port=8501 --server.runOnSave=True
+	@uv run streamlit run frontend/app.py --server.port=8501 --server.runOnSave=True
 
 # Utilities
 test: ## Run tests

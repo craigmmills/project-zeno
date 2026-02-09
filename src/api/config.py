@@ -2,7 +2,9 @@ from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
-load_dotenv()
+# Load .env first, then override with .env.local
+load_dotenv(".env")
+load_dotenv(".env.local", override=True)
 
 
 class _APISettings(BaseSettings):
@@ -47,7 +49,7 @@ class _APISettings(BaseSettings):
         return value
 
     model_config = {
-        "env_file": ".env",
+        "env_file": (".env", ".env.local"),
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }

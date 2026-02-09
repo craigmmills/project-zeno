@@ -755,9 +755,17 @@ async def extract_anonymous_session_cookie(request: Request) -> Optional[str]:
     """
 
     # Extract anonymous session ID from auth header (validation already done in fetch_user_from_rw_api)
-    auth_header = request.headers["Authorization"]
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        # Generate a session ID from request info for truly anonymous users
+        client_ip = request.client.host if request.client else "unknown"
+        return f"{ANONYMOUS_USER_PREFIX}:{client_ip}"
     credentials = auth_header.strip("Bearer ")
-    [scheme, anonymous_id] = credentials.split(":", 1)
+    parts = credentials.split(":", 1)
+    if len(parts) != 2:
+        client_ip = request.client.host if request.client else "unknown"
+        return f"{ANONYMOUS_USER_PREFIX}:{client_ip}"
+    [scheme, anonymous_id] = parts
     return f"{ANONYMOUS_USER_PREFIX}:{anonymous_id}"
 
 

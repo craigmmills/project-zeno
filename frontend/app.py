@@ -4,7 +4,9 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env first, then override with .env.local
+load_dotenv(".env")
+load_dotenv(".env.local", override=True)
 st.set_page_config(page_title="Zeno", page_icon="🦣")
 
 # API_BASE_URL = os.environ["API_BASE_URL"]

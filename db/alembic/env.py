@@ -2,7 +2,14 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
+
+# Load .env first, then override with .env.local
+from pathlib import Path
+project_root = Path(__file__).parent.parent.parent
+load_dotenv(project_root / ".env")
+load_dotenv(project_root / ".env.local", override=True)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -9,10 +9,12 @@ from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
+# Load .env first, then override with .env.local
+load_dotenv(".env")
+load_dotenv(".env.local", override=True)
+
 from src.agent.tools.data_handlers.analytics_handler import DATASETS
 from src.shared.config import SharedSettings
-
-load_dotenv()
 
 embeddings = GoogleGenerativeAIEmbeddings(
     model=SharedSettings.dataset_embeddings_model,

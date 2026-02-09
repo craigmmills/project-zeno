@@ -8,14 +8,16 @@ import requests
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
+# Load .env first, then override with .env.local
+load_dotenv(".env")
+load_dotenv(".env.local", override=True)
+
 from src.ingest.utils import (
     create_geometry_index_if_not_exists,
     create_id_index_if_not_exists,
     create_text_search_index_if_not_exists,
 )
 from src.shared.geocoding_helpers import GADM_LEVELS, SOURCE_ID_MAPPING
-
-load_dotenv()
 
 
 GADM_ZIP_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/gadm_410-levels.zip"
