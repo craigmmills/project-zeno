@@ -56,6 +56,11 @@ from src.api.chart_renderer import (
     render_chart_png,
 )
 from src.api.chart_selector import select_best_chart_with_debug
+from src.api.map_renderer import (
+    MapRenderError,
+    MapRenderUnsupported,
+    render_map_png,
+)
 from src.api.config import APISettings
 from src.api.data_models import (
     CustomAreaOrm,
@@ -764,69 +769,119 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 _telegram_update_cache[update_id] = "done"
                 return
 
-            if action != TELEGRAM_CALLBACK_ACTION_CHART:
-                await _send_telegram_message(
+            if action == TELEGRAM_CALLBACK_ACTION_CHART:
+                chart_payload = context.get("charts_data") or []
+                if not chart_payload:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text="No chart available for this response.",
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+
+                selected_chart, _ = select_best_chart_with_debug(
+                    query=context.get("query") or "",
+                    charts_data=chart_payload,
+                )
+                if not selected_chart:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text="No chart available for this response.",
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+
+                chart_started = time.perf_counter()
+                chart_png = render_chart_png(
+                    chart=selected_chart,
+                    width_px=APISettings.lite_chart_width_px,
+                    height_px=APISettings.lite_chart_height_px,
+                    dpi=APISettings.lite_chart_render_dpi,
+                )
+                chart_render_ms = int(
+                    (time.perf_counter() - chart_started) * 1000
+                )
+                caption = str(selected_chart.get("insight") or "")
+                caption = caption[: APISettings.lite_chart_caption_max_chars]
+
+                await _send_telegram_photo(
                     bot_token=APISettings.telegram_bot_token,
                     chat_id=parsed["chat_id"],
-                    text="Map rendering is not enabled yet for this bot.",
+                    photo_bytes=chart_png,
+                    caption=caption,
                     message_thread_id=parsed.get("message_thread_id"),
+                )
+                logger.info(
+                    "Telegram callback chart sent",
+                    platform="telegram",
+                    telegram_event_type="callback",
+                    interaction_action="chart",
+                    interaction_status="ok",
+                    interaction_token_present=True,
+                    chart_render_ms=chart_render_ms,
+                    update_id=update_id,
                 )
                 _telegram_update_cache[update_id] = "done"
                 return
 
-            chart_payload = context.get("charts_data") or []
-            if not chart_payload:
-                await _send_telegram_message(
+            if action == TELEGRAM_CALLBACK_ACTION_MAP:
+                if not APISettings.lite_telegram_enable_maps:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text="Map unavailable for this response.",
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+
+                aoi = context.get("aoi")
+                if not aoi:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text="Map unavailable for this response.",
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+
+                map_started = time.perf_counter()
+                map_png = await render_map_png(
+                    aoi=aoi,
+                    dataset=context.get("dataset"),
+                    width_px=APISettings.lite_chart_width_px,
+                    height_px=APISettings.lite_chart_height_px,
+                    dpi=APISettings.lite_chart_render_dpi,
+                )
+                map_render_ms = int((time.perf_counter() - map_started) * 1000)
+
+                map_caption = str(context.get("summary_text") or "")
+                map_caption = map_caption[: APISettings.lite_map_caption_max_chars]
+
+                await _send_telegram_photo(
                     bot_token=APISettings.telegram_bot_token,
                     chat_id=parsed["chat_id"],
-                    text="No chart available for this response.",
+                    photo_bytes=map_png,
+                    caption=map_caption,
                     message_thread_id=parsed.get("message_thread_id"),
+                )
+                logger.info(
+                    "Telegram callback map sent",
+                    platform="telegram",
+                    telegram_event_type="callback",
+                    interaction_action="map",
+                    interaction_status="ok",
+                    interaction_token_present=True,
+                    map_render_ms=map_render_ms,
+                    update_id=update_id,
                 )
                 _telegram_update_cache[update_id] = "done"
                 return
-
-            selected_chart, _ = select_best_chart_with_debug(
-                query=context.get("query") or "",
-                charts_data=chart_payload,
-            )
-            if not selected_chart:
-                await _send_telegram_message(
-                    bot_token=APISettings.telegram_bot_token,
-                    chat_id=parsed["chat_id"],
-                    text="No chart available for this response.",
-                    message_thread_id=parsed.get("message_thread_id"),
-                )
-                _telegram_update_cache[update_id] = "done"
-                return
-
-            chart_started = time.perf_counter()
-            chart_png = render_chart_png(
-                chart=selected_chart,
-                width_px=APISettings.lite_chart_width_px,
-                height_px=APISettings.lite_chart_height_px,
-                dpi=APISettings.lite_chart_render_dpi,
-            )
-            chart_render_ms = int((time.perf_counter() - chart_started) * 1000)
-            caption = str(selected_chart.get("insight") or "")
-            caption = caption[: APISettings.lite_chart_caption_max_chars]
-
-            await _send_telegram_photo(
-                bot_token=APISettings.telegram_bot_token,
-                chat_id=parsed["chat_id"],
-                photo_bytes=chart_png,
-                caption=caption,
-                message_thread_id=parsed.get("message_thread_id"),
-            )
-            logger.info(
-                "Telegram callback chart sent",
-                platform="telegram",
-                telegram_event_type="callback",
-                interaction_action="chart",
-                interaction_status="ok",
-                interaction_token_present=True,
-                chart_render_ms=chart_render_ms,
-                update_id=update_id,
-            )
         except Exception:
             logger.exception(
                 "Telegram callback processing failed",
