@@ -482,6 +482,24 @@ def _build_telegram_artifact_keyboard(token: str) -> Dict[str, Any]:
     }
 
 
+def _parse_callback_data(data: str) -> Optional[tuple[str, str]]:
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return None
+
+    prefix, action, token = parts
+    if prefix != TELEGRAM_CALLBACK_PREFIX or not token:
+        return None
+
+    if action not in {
+        TELEGRAM_CALLBACK_ACTION_CHART,
+        TELEGRAM_CALLBACK_ACTION_MAP,
+    }:
+        return None
+
+    return action, token
+
+
 async def _send_telegram_typing(bot_token: str, chat_id: int):
     """Send 'typing...' indicator to the user."""
     url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
@@ -519,6 +537,23 @@ async def _send_telegram_message(
             payload["text"] = text
             del payload["parse_mode"]
             response = await client.post(url, json=payload, timeout=15)
+        response.raise_for_status()
+
+
+async def _send_telegram_callback_answer(
+    bot_token: str,
+    callback_query_id: str,
+    text: Optional[str] = None,
+):
+    payload: Dict[str, Any] = {
+        "callback_query_id": callback_query_id,
+    }
+    if text:
+        payload["text"] = text
+
+    url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, timeout=10)
         response.raise_for_status()
 
 
@@ -667,14 +702,140 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
     event_type = parsed.get("event_type", "message")
 
     if event_type == "callback":
-        logger.info(
-            "Telegram callback update accepted",
-            platform="telegram",
-            telegram_event_type="callback",
-            status="accepted",
-            update_id=update_id,
-        )
-        _telegram_update_cache[update_id] = "done"
+        try:
+            await _send_telegram_callback_answer(
+                bot_token=APISettings.telegram_bot_token,
+                callback_query_id=parsed["callback_query_id"],
+            )
+
+            callback_payload = _parse_callback_data(parsed.get("data", ""))
+            if not callback_payload:
+                logger.info(
+                    "Telegram callback ignored",
+                    platform="telegram",
+                    telegram_event_type="callback",
+                    interaction_status="invalid_payload",
+                    interaction_token_present=False,
+                    update_id=update_id,
+                )
+                _telegram_update_cache[update_id] = "done"
+                return
+
+            action, token = callback_payload
+            context = _telegram_interaction_cache.get(token)
+
+            if not context:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text="This selection expired. Ask your question again.",
+                    message_thread_id=parsed.get("message_thread_id"),
+                )
+                logger.info(
+                    "Telegram callback token missing",
+                    platform="telegram",
+                    telegram_event_type="callback",
+                    interaction_action=action,
+                    interaction_status="expired",
+                    interaction_token_present=True,
+                    update_id=update_id,
+                )
+                _telegram_update_cache[update_id] = "done"
+                return
+
+            if context.get("chat_id") != parsed.get("chat_id") or (
+                context.get("user_id") != parsed.get("user_id")
+            ):
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text="This selection is no longer valid.",
+                    message_thread_id=parsed.get("message_thread_id"),
+                )
+                logger.info(
+                    "Telegram callback token rejected",
+                    platform="telegram",
+                    telegram_event_type="callback",
+                    interaction_action=action,
+                    interaction_status="invalid_token",
+                    interaction_token_present=True,
+                    update_id=update_id,
+                )
+                _telegram_update_cache[update_id] = "done"
+                return
+
+            if action != TELEGRAM_CALLBACK_ACTION_CHART:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text="Map rendering is not enabled yet for this bot.",
+                    message_thread_id=parsed.get("message_thread_id"),
+                )
+                _telegram_update_cache[update_id] = "done"
+                return
+
+            chart_payload = context.get("charts_data") or []
+            if not chart_payload:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text="No chart available for this response.",
+                    message_thread_id=parsed.get("message_thread_id"),
+                )
+                _telegram_update_cache[update_id] = "done"
+                return
+
+            selected_chart, _ = select_best_chart_with_debug(
+                query=context.get("query") or "",
+                charts_data=chart_payload,
+            )
+            if not selected_chart:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text="No chart available for this response.",
+                    message_thread_id=parsed.get("message_thread_id"),
+                )
+                _telegram_update_cache[update_id] = "done"
+                return
+
+            chart_started = time.perf_counter()
+            chart_png = render_chart_png(
+                chart=selected_chart,
+                width_px=APISettings.lite_chart_width_px,
+                height_px=APISettings.lite_chart_height_px,
+                dpi=APISettings.lite_chart_render_dpi,
+            )
+            chart_render_ms = int((time.perf_counter() - chart_started) * 1000)
+            caption = str(selected_chart.get("insight") or "")
+            caption = caption[: APISettings.lite_chart_caption_max_chars]
+
+            await _send_telegram_photo(
+                bot_token=APISettings.telegram_bot_token,
+                chat_id=parsed["chat_id"],
+                photo_bytes=chart_png,
+                caption=caption,
+                message_thread_id=parsed.get("message_thread_id"),
+            )
+            logger.info(
+                "Telegram callback chart sent",
+                platform="telegram",
+                telegram_event_type="callback",
+                interaction_action="chart",
+                interaction_status="ok",
+                interaction_token_present=True,
+                chart_render_ms=chart_render_ms,
+                update_id=update_id,
+            )
+        except Exception:
+            logger.exception(
+                "Telegram callback processing failed",
+                platform="telegram",
+                telegram_event_type="callback",
+                update_id=update_id,
+            )
+        finally:
+            _telegram_update_cache[update_id] = "done"
         return
 
     user_id = parsed["user_id"]
