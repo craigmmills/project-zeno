@@ -10,6 +10,7 @@ from src.api.app import (
     _split_text_for_telegram,
     _telegram_update_cache,
 )
+from src.api.chart_renderer import ChartRenderError
 from src.api.config import APISettings
 
 pytestmark = pytest.mark.asyncio
@@ -20,10 +21,14 @@ def reset_telegram_settings_and_cache():
     old_secret = APISettings.telegram_webhook_secret
     old_token = APISettings.telegram_bot_token
     old_char_limit = APISettings.lite_telegram_message_char_limit
+    old_enable_charts = APISettings.lite_telegram_enable_charts
+    old_caption_max = APISettings.lite_chart_caption_max_chars
 
     APISettings.telegram_webhook_secret = "test-secret"
     APISettings.telegram_bot_token = "test-token"
     APISettings.lite_telegram_message_char_limit = 4096
+    APISettings.lite_telegram_enable_charts = True
+    APISettings.lite_chart_caption_max_chars = 1024
     _telegram_update_cache.clear()
 
     yield
@@ -31,6 +36,8 @@ def reset_telegram_settings_and_cache():
     APISettings.telegram_webhook_secret = old_secret
     APISettings.telegram_bot_token = old_token
     APISettings.lite_telegram_message_char_limit = old_char_limit
+    APISettings.lite_telegram_enable_charts = old_enable_charts
+    APISettings.lite_chart_caption_max_chars = old_caption_max
     _telegram_update_cache.clear()
 
 
@@ -44,7 +51,9 @@ async def test_telegram_webhook_rejects_invalid_secret(client):
     assert response.status_code == 401
 
 
-async def test_telegram_webhook_accepts_and_schedules_background_processing(client):
+async def test_telegram_webhook_accepts_and_schedules_background_processing(
+    client,
+):
     payload = {
         "update_id": 1001,
         "message": {
@@ -120,7 +129,9 @@ async def test_telegram_background_processing_sends_friendly_error_on_failure():
             "src.api.app._run_lite_agent_for_telegram",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ),
-        patch("src.api.app._send_telegram_message", new=AsyncMock()) as send_message,
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
     ):
         await _process_telegram_update(update_id=3003, parsed=parsed)
 
@@ -130,6 +141,213 @@ async def test_telegram_background_processing_sends_friendly_error_on_failure():
         text=TELEGRAM_FRIENDLY_ERROR_TEXT,
         message_thread_id=None,
     )
+
+
+async def test_telegram_sends_photo_when_chart_exists():
+    parsed = {
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": 99,
+        "text": "show trend",
+    }
+    chart = {
+        "id": "main_chart",
+        "type": "line",
+        "title": "Trend",
+        "insight": "Insight",
+        "data": [{"year": 2020, "value": 1}],
+        "xAxis": "year",
+        "yAxis": "value",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={"text": "Result", "charts_data": [chart]}
+            ),
+        ),
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+        patch(
+            "src.api.app.select_best_chart_with_debug",
+            return_value=(chart, []),
+        ),
+        patch("src.api.app.render_chart_png", return_value=b"\x89PNGmock"),
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=100, parsed=parsed)
+
+    send_message.assert_awaited_once()
+    send_photo.assert_awaited_once()
+
+
+async def test_telegram_text_still_sent_when_render_fails():
+    parsed = {
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+    chart = {
+        "id": "main_chart",
+        "type": "line",
+        "title": "Trend",
+        "insight": "Insight",
+        "data": [{"year": 2020, "value": 1}],
+        "xAxis": "year",
+        "yAxis": "value",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={"text": "Result", "charts_data": [chart]}
+            ),
+        ),
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+        patch(
+            "src.api.app.select_best_chart_with_debug",
+            return_value=(chart, []),
+        ),
+        patch(
+            "src.api.app.render_chart_png",
+            side_effect=ChartRenderError("bad chart"),
+        ),
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=101, parsed=parsed)
+
+    send_message.assert_awaited_once()
+    send_photo.assert_not_called()
+
+
+async def test_telegram_caption_truncated_and_message_thread_id_passed():
+    APISettings.lite_chart_caption_max_chars = 10
+
+    parsed = {
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": 123,
+        "text": "show trend",
+    }
+    chart = {
+        "id": "main_chart",
+        "type": "line",
+        "title": "Trend",
+        "insight": "Very long chart insight that should be truncated",
+        "data": [{"year": 2020, "value": 1}],
+        "xAxis": "year",
+        "yAxis": "value",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={"text": "Result", "charts_data": [chart]}
+            ),
+        ),
+        patch("src.api.app._send_telegram_message", new=AsyncMock()),
+        patch(
+            "src.api.app.select_best_chart_with_debug",
+            return_value=(chart, []),
+        ),
+        patch("src.api.app.render_chart_png", return_value=b"\x89PNGmock"),
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=102, parsed=parsed)
+
+    _, kwargs = send_photo.await_args
+    assert len(kwargs["caption"]) == 10
+    assert kwargs["message_thread_id"] == 123
+
+
+async def test_telegram_no_charts_does_not_send_photo():
+    parsed = {
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(return_value={"text": "Result", "charts_data": []}),
+        ),
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=103, parsed=parsed)
+
+    send_message.assert_awaited_once()
+    send_photo.assert_not_called()
+
+
+async def test_telegram_send_order_message_before_photo():
+    parsed = {
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+    chart = {
+        "id": "main_chart",
+        "type": "line",
+        "title": "Trend",
+        "insight": "Insight",
+        "data": [{"year": 2020, "value": 1}],
+        "xAxis": "year",
+        "yAxis": "value",
+    }
+    events: list[str] = []
+
+    async def _record_message(**kwargs):
+        events.append("message")
+
+    async def _record_photo(**kwargs):
+        events.append("photo")
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={"text": "Result", "charts_data": [chart]}
+            ),
+        ),
+        patch(
+            "src.api.app._send_telegram_message", side_effect=_record_message
+        ),
+        patch(
+            "src.api.app.select_best_chart_with_debug",
+            return_value=(chart, []),
+        ),
+        patch("src.api.app.render_chart_png", return_value=b"\x89PNGmock"),
+        patch("src.api.app._send_telegram_photo", side_effect=_record_photo),
+    ):
+        await _process_telegram_update(update_id=104, parsed=parsed)
+
+    assert events == ["message", "photo"]
 
 
 def test_rewrite_lite_response_removes_ui_language_and_caps_words():
@@ -155,13 +373,19 @@ async def test_run_lite_agent_uses_lite_channel_and_thread_id():
         return_value={
             "messages": [
                 {"type": "ai", "content": "Short summary"},
-            ]
+            ],
+            "charts_data": [{"id": "main_chart"}],
         }
     )
 
     with (
-        patch("src.api.app.fetch_zeno", new=AsyncMock(return_value=mock_agent)) as fetch,
-        patch("src.api.app.get_small_model", side_effect=RuntimeError("skip model rewrite")),
+        patch(
+            "src.api.app.fetch_zeno", new=AsyncMock(return_value=mock_agent)
+        ) as fetch,
+        patch(
+            "src.api.app.get_small_model",
+            side_effect=RuntimeError("skip model rewrite"),
+        ),
     ):
         result = await _run_lite_agent_for_telegram(
             query="hello",
@@ -169,7 +393,8 @@ async def test_run_lite_agent_uses_lite_channel_and_thread_id():
             user_id=77,
         )
 
-    assert result == "Short summary"
+    assert result["text"] == "Short summary"
+    assert result["charts_data"] == [{"id": "main_chart"}]
     fetch.assert_awaited_once_with(channel="lite")
     _, kwargs = mock_agent.ainvoke.await_args
     assert kwargs["config"]["configurable"]["thread_id"] == "telegram:77"

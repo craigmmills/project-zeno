@@ -46,6 +46,19 @@ class _APISettings(BaseSettings):
     lite_enable_model_rewrite: bool = Field(
         default=True, alias="LITE_ENABLE_MODEL_REWRITE"
     )
+    lite_telegram_enable_charts: bool = Field(
+        default=True, alias="LITE_TELEGRAM_ENABLE_CHARTS"
+    )
+    lite_chart_caption_max_chars: int = Field(
+        default=1024, alias="LITE_CHART_CAPTION_MAX_CHARS"
+    )
+    lite_chart_render_dpi: int = Field(
+        default=180, alias="LITE_CHART_RENDER_DPI"
+    )
+    lite_chart_width_px: int = Field(default=1200, alias="LITE_CHART_WIDTH_PX")
+    lite_chart_height_px: int = Field(
+        default=750, alias="LITE_CHART_HEIGHT_PX"
+    )
 
     @property
     def domains_allowlist(self) -> list[str]:

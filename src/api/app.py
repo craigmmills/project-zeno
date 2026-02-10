@@ -49,6 +49,12 @@ from src.agent.graph import (
 )
 from src.agent.llms import SMALL_MODEL, get_model, get_small_model
 from src.api.auth import MACHINE_USER_PREFIX, validate_machine_user_token
+from src.api.chart_renderer import (
+    ChartRenderError,
+    ChartRenderUnsupported,
+    render_chart_png,
+)
+from src.api.chart_selector import select_best_chart_with_debug
 from src.api.config import APISettings
 from src.api.data_models import (
     CustomAreaOrm,
@@ -313,7 +319,9 @@ Source response:
     try:
         model = get_small_model()
         llm_response = await model.ainvoke(prompt)
-        llm_text = _message_content_to_text(getattr(llm_response, "content", ""))
+        llm_text = _message_content_to_text(
+            getattr(llm_response, "content", "")
+        )
         final_text = _rewrite_lite_response(llm_text, max_words=max_words)
         return final_text or deterministic
     except Exception as e:
@@ -382,7 +390,9 @@ def _markdown_to_telegram_html(text: str) -> str:
         # Convert markdown headings to bold
         heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
         if heading_match:
-            result_lines.append(f"<b>{html_mod.escape(heading_match.group(2))}</b>")
+            result_lines.append(
+                f"<b>{html_mod.escape(heading_match.group(2))}</b>"
+            )
             continue
         # Convert markdown bullet points to unicode bullets
         bullet_match = re.match(r"^[\*\-]\s+(.+)$", stripped)
@@ -396,6 +406,7 @@ def _markdown_to_telegram_html(text: str) -> str:
     # Convert bold **text** to <b>text</b> (do before escaping)
     # Extract bold segments, escape everything, then re-insert tags
     bold_parts = []
+
     def _capture_bold(m):
         bold_parts.append(m.group(1))
         return f"\x00BOLD{len(bold_parts) - 1}\x00"
@@ -404,6 +415,7 @@ def _markdown_to_telegram_html(text: str) -> str:
 
     # Convert italic *text* to <i>text</i>
     italic_parts = []
+
     def _capture_italic(m):
         italic_parts.append(m.group(1))
         return f"\x00ITALIC{len(italic_parts) - 1}\x00"
@@ -415,9 +427,13 @@ def _markdown_to_telegram_html(text: str) -> str:
 
     # Re-insert bold/italic tags
     for i, part in enumerate(bold_parts):
-        text = text.replace(f"\x00BOLD{i}\x00", f"<b>{html_mod.escape(part)}</b>")
+        text = text.replace(
+            f"\x00BOLD{i}\x00", f"<b>{html_mod.escape(part)}</b>"
+        )
     for i, part in enumerate(italic_parts):
-        text = text.replace(f"\x00ITALIC{i}\x00", f"<i>{html_mod.escape(part)}</i>")
+        text = text.replace(
+            f"\x00ITALIC{i}\x00", f"<i>{html_mod.escape(part)}</i>"
+        )
 
     # Collapse excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -429,7 +445,9 @@ async def _send_telegram_typing(bot_token: str, chat_id: int):
     """Send 'typing...' indicator to the user."""
     url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chat_id": chat_id, "action": "typing"}, timeout=5)
+        await client.post(
+            url, json={"chat_id": chat_id, "action": "typing"}, timeout=5
+        )
 
 
 async def _send_telegram_message(
@@ -460,11 +478,44 @@ async def _send_telegram_message(
         response.raise_for_status()
 
 
+async def _send_telegram_photo(
+    bot_token: str,
+    chat_id: int,
+    photo_bytes: bytes,
+    caption: str,
+    message_thread_id: Optional[int] = None,
+):
+    payload: Dict[str, Any] = {
+        "chat_id": str(chat_id),
+        "caption": caption,
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = str(message_thread_id)
+
+    files = {
+        "photo": (
+            "chart.png",
+            photo_bytes,
+            "image/png",
+        )
+    }
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            url,
+            data=payload,
+            files=files,
+            timeout=20,
+        )
+        response.raise_for_status()
+
+
 async def _run_lite_agent_for_telegram(
     query: str,
     thread_id: str,
     user_id: int,
-) -> str:
+) -> Dict[str, Any]:
     zeno_async = await fetch_zeno(channel="lite")
     config = {
         "configurable": {"thread_id": thread_id},
@@ -483,13 +534,24 @@ async def _run_lite_agent_for_telegram(
 
     result = await zeno_async.ainvoke(state_updates, config=config)
     final_text = _extract_final_agent_text(result)
-    return await _format_lite_response_hybrid(
+    formatted_text = await _format_lite_response_hybrid(
         final_text,
         max_words=APISettings.lite_max_response_words,
     )
 
+    charts_data = result.get("charts_data") or []
+    if not isinstance(charts_data, list):
+        charts_data = []
 
-def _parse_telegram_update(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    return {
+        "text": formatted_text,
+        "charts_data": charts_data,
+    }
+
+
+def _parse_telegram_update(
+    payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
     message = payload.get("message")
     if not message:
         return None
@@ -515,7 +577,9 @@ def _parse_telegram_update(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _telegram_error_message_and_category(error: Exception) -> tuple[str, str]:
-    if isinstance(error, (httpx.TimeoutException, TimeoutError, ConnectionError)):
+    if isinstance(
+        error, (httpx.TimeoutException, TimeoutError, ConnectionError)
+    ):
         return TELEGRAM_FRIENDLY_ERROR_TEXT, "transient"
     if isinstance(error, ValueError):
         return TELEGRAM_UNSUPPORTED_ERROR_TEXT, "unsupported"
@@ -528,12 +592,16 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
     thread_id = f"telegram:{user_id}"
 
     try:
-        await _send_telegram_typing(APISettings.telegram_bot_token, parsed["chat_id"])
-        final_text = await _run_lite_agent_for_telegram(
+        await _send_telegram_typing(
+            APISettings.telegram_bot_token,
+            parsed["chat_id"],
+        )
+        result = await _run_lite_agent_for_telegram(
             query=parsed["text"],
             thread_id=thread_id,
             user_id=user_id,
         )
+        final_text = result.get("text") or ""
         parts = _split_text_for_telegram(
             final_text,
             max_chars=APISettings.lite_telegram_message_char_limit,
@@ -546,6 +614,166 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 text=part,
                 message_thread_id=parsed["message_thread_id"],
             )
+
+        chart_select_ms = 0
+        chart_render_ms = 0
+        chart_send_ms = 0
+        chart_payload = result.get("charts_data") or []
+
+        if not APISettings.lite_telegram_enable_charts:
+            logger.info(
+                "Telegram chart pipeline skipped",
+                platform="telegram",
+                user_id=str(user_id),
+                thread_id=thread_id,
+                chart_status="chart_disabled",
+            )
+        elif not chart_payload:
+            logger.info(
+                "Telegram chart not sent",
+                platform="telegram",
+                user_id=str(user_id),
+                thread_id=thread_id,
+                chart_status="chart_missing",
+            )
+        else:
+            chart_select_started = time.perf_counter()
+            selected_chart, selector_debug = select_best_chart_with_debug(
+                query=parsed["text"],
+                charts_data=chart_payload,
+            )
+            chart_select_ms = int(
+                (time.perf_counter() - chart_select_started) * 1000
+            )
+
+            selector_debug_small = selector_debug[:5]
+
+            if not selected_chart:
+                selector_statuses = {
+                    item.get("status")
+                    for item in selector_debug_small
+                    if isinstance(item, dict)
+                }
+                chart_status = "chart_not_selected"
+                if selector_statuses == {"chart_invalid_schema"}:
+                    chart_status = "chart_invalid_schema"
+                elif (
+                    "chart_unsupported" in selector_statuses
+                    and "chart_invalid_schema" not in selector_statuses
+                ):
+                    chart_status = "chart_unsupported"
+
+                logger.info(
+                    "Telegram chart not selected",
+                    platform="telegram",
+                    user_id=str(user_id),
+                    thread_id=thread_id,
+                    chart_status=chart_status,
+                    chart_select_ms=chart_select_ms,
+                    selector_debug=selector_debug_small,
+                )
+            else:
+                chart_id = selected_chart.get("id")
+                chart_type = selected_chart.get("type")
+
+                try:
+                    chart_render_started = time.perf_counter()
+                    chart_png = render_chart_png(
+                        chart=selected_chart,
+                        width_px=APISettings.lite_chart_width_px,
+                        height_px=APISettings.lite_chart_height_px,
+                        dpi=APISettings.lite_chart_render_dpi,
+                    )
+                    chart_render_ms = int(
+                        (time.perf_counter() - chart_render_started) * 1000
+                    )
+                except ChartRenderUnsupported:
+                    logger.info(
+                        "Telegram chart unsupported",
+                        platform="telegram",
+                        user_id=str(user_id),
+                        thread_id=thread_id,
+                        chart_id=chart_id,
+                        chart_type=chart_type,
+                        chart_status="chart_unsupported",
+                        chart_select_ms=chart_select_ms,
+                        chart_render_ms=chart_render_ms,
+                        chart_send_ms=chart_send_ms,
+                        selector_debug=selector_debug_small,
+                    )
+                except ChartRenderError:
+                    logger.exception(
+                        "Telegram chart render failed",
+                        platform="telegram",
+                        user_id=str(user_id),
+                        thread_id=thread_id,
+                        chart_id=chart_id,
+                        chart_type=chart_type,
+                        chart_status="chart_render_failed",
+                        chart_select_ms=chart_select_ms,
+                        chart_render_ms=chart_render_ms,
+                        chart_send_ms=chart_send_ms,
+                        selector_debug=selector_debug_small,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Telegram chart render failed",
+                        platform="telegram",
+                        user_id=str(user_id),
+                        thread_id=thread_id,
+                        chart_id=chart_id,
+                        chart_type=chart_type,
+                        chart_status="chart_render_failed",
+                        chart_select_ms=chart_select_ms,
+                        chart_render_ms=chart_render_ms,
+                        chart_send_ms=chart_send_ms,
+                        selector_debug=selector_debug_small,
+                    )
+                else:
+                    caption = str(selected_chart.get("insight") or "")
+                    caption = caption[
+                        : APISettings.lite_chart_caption_max_chars
+                    ]
+
+                    try:
+                        chart_send_started = time.perf_counter()
+                        await _send_telegram_photo(
+                            bot_token=APISettings.telegram_bot_token,
+                            chat_id=parsed["chat_id"],
+                            photo_bytes=chart_png,
+                            caption=caption,
+                            message_thread_id=parsed["message_thread_id"],
+                        )
+                        chart_send_ms = int(
+                            (time.perf_counter() - chart_send_started) * 1000
+                        )
+                        logger.info(
+                            "Telegram chart sent",
+                            platform="telegram",
+                            user_id=str(user_id),
+                            thread_id=thread_id,
+                            chart_id=chart_id,
+                            chart_type=chart_type,
+                            chart_status="chart_sent",
+                            chart_select_ms=chart_select_ms,
+                            chart_render_ms=chart_render_ms,
+                            chart_send_ms=chart_send_ms,
+                            selector_debug=selector_debug_small,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Telegram chart send failed",
+                            platform="telegram",
+                            user_id=str(user_id),
+                            thread_id=thread_id,
+                            chart_id=chart_id,
+                            chart_type=chart_type,
+                            chart_status="chart_send_failed",
+                            chart_select_ms=chart_select_ms,
+                            chart_render_ms=chart_render_ms,
+                            chart_send_ms=chart_send_ms,
+                            selector_debug=selector_debug_small,
+                        )
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
@@ -1559,7 +1787,9 @@ async def telegram_webhook(
         asyncio.create_task(_process_telegram_update(update_id, parsed))
     except Exception:
         _telegram_update_cache.pop(update_id, None)
-        raise HTTPException(status_code=500, detail="Failed to schedule update")
+        raise HTTPException(
+            status_code=500, detail="Failed to schedule update"
+        )
 
     return {"ok": True, "accepted": True}
 
