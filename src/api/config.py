@@ -49,8 +49,23 @@ class _APISettings(BaseSettings):
     lite_telegram_enable_charts: bool = Field(
         default=True, alias="LITE_TELEGRAM_ENABLE_CHARTS"
     )
+    lite_telegram_enable_map_buttons: bool = Field(
+        default=True, alias="LITE_TELEGRAM_ENABLE_MAP_BUTTONS"
+    )
+    lite_telegram_enable_maps: bool = Field(
+        default=True, alias="LITE_TELEGRAM_ENABLE_MAPS"
+    )
+    lite_telegram_interaction_ttl_seconds: int = Field(
+        default=3600, alias="LITE_TELEGRAM_INTERACTION_TTL_SECONDS"
+    )
+    lite_telegram_interaction_cache_size: int = Field(
+        default=100000, alias="LITE_TELEGRAM_INTERACTION_CACHE_SIZE"
+    )
     lite_chart_caption_max_chars: int = Field(
         default=1024, alias="LITE_CHART_CAPTION_MAX_CHARS"
+    )
+    lite_map_caption_max_chars: int = Field(
+        default=1024, alias="LITE_MAP_CAPTION_MAX_CHARS"
     )
     lite_chart_render_dpi: int = Field(
         default=180, alias="LITE_CHART_RENDER_DPI"

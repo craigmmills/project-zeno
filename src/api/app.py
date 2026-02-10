@@ -120,6 +120,12 @@ TELEGRAM_UNSUPPORTED_ERROR_TEXT = (
 # values: processing | done
 _telegram_update_cache = cachetools.TTLCache(maxsize=100_000, ttl=60 * 60 * 24)
 
+# Interaction cache for Telegram callback buttons
+_telegram_interaction_cache = cachetools.TTLCache(
+    maxsize=APISettings.lite_telegram_interaction_cache_size,
+    ttl=APISettings.lite_telegram_interaction_ttl_seconds,
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
