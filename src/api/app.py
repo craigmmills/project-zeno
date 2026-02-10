@@ -56,11 +56,6 @@ from src.api.chart_renderer import (
     render_chart_png,
 )
 from src.api.chart_selector import select_best_chart_with_debug
-from src.api.map_renderer import (
-    MapRenderError,
-    MapRenderUnsupported,
-    render_map_png,
-)
 from src.api.config import APISettings
 from src.api.data_models import (
     CustomAreaOrm,
@@ -70,6 +65,11 @@ from src.api.data_models import (
     UserOrm,
     UserType,
     WhitelistedUserOrm,
+)
+from src.api.map_renderer import (
+    MapRenderError,
+    MapRenderUnsupported,
+    render_map_png,
 )
 from src.api.schemas import (
     ChatRequest,
@@ -796,12 +796,50 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                     return
 
                 chart_started = time.perf_counter()
-                chart_png = render_chart_png(
-                    chart=selected_chart,
-                    width_px=APISettings.lite_chart_width_px,
-                    height_px=APISettings.lite_chart_height_px,
-                    dpi=APISettings.lite_chart_render_dpi,
-                )
+                try:
+                    chart_png = render_chart_png(
+                        chart=selected_chart,
+                        width_px=APISettings.lite_chart_width_px,
+                        height_px=APISettings.lite_chart_height_px,
+                        dpi=APISettings.lite_chart_render_dpi,
+                    )
+                except ChartRenderUnsupported:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text="No chart available for this response.",
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    logger.info(
+                        "Telegram callback chart unsupported",
+                        platform="telegram",
+                        telegram_event_type="callback",
+                        interaction_action="chart",
+                        interaction_status="render_failed",
+                        interaction_token_present=True,
+                        update_id=update_id,
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+                except ChartRenderError:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text=TELEGRAM_FRIENDLY_ERROR_TEXT,
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    logger.info(
+                        "Telegram callback chart render failed",
+                        platform="telegram",
+                        telegram_event_type="callback",
+                        interaction_action="chart",
+                        interaction_status="render_failed",
+                        interaction_token_present=True,
+                        update_id=update_id,
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+
                 chart_render_ms = int(
                     (time.perf_counter() - chart_started) * 1000
                 )
@@ -851,13 +889,51 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                     return
 
                 map_started = time.perf_counter()
-                map_png = await render_map_png(
-                    aoi=aoi,
-                    dataset=context.get("dataset"),
-                    width_px=APISettings.lite_chart_width_px,
-                    height_px=APISettings.lite_chart_height_px,
-                    dpi=APISettings.lite_chart_render_dpi,
-                )
+                try:
+                    map_png = await render_map_png(
+                        aoi=aoi,
+                        dataset=context.get("dataset"),
+                        width_px=APISettings.lite_chart_width_px,
+                        height_px=APISettings.lite_chart_height_px,
+                        dpi=APISettings.lite_chart_render_dpi,
+                    )
+                except MapRenderUnsupported:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text="Map unavailable for this response.",
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    logger.info(
+                        "Telegram callback map unsupported",
+                        platform="telegram",
+                        telegram_event_type="callback",
+                        interaction_action="map",
+                        interaction_status="render_failed",
+                        interaction_token_present=True,
+                        update_id=update_id,
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+                except MapRenderError:
+                    await _send_telegram_message(
+                        bot_token=APISettings.telegram_bot_token,
+                        chat_id=parsed["chat_id"],
+                        text=TELEGRAM_FRIENDLY_ERROR_TEXT,
+                        message_thread_id=parsed.get("message_thread_id"),
+                    )
+                    logger.info(
+                        "Telegram callback map render failed",
+                        platform="telegram",
+                        telegram_event_type="callback",
+                        interaction_action="map",
+                        interaction_status="render_failed",
+                        interaction_token_present=True,
+                        update_id=update_id,
+                    )
+                    _telegram_update_cache[update_id] = "done"
+                    return
+
                 map_render_ms = int((time.perf_counter() - map_started) * 1000)
 
                 map_caption = str(context.get("summary_text") or "")
@@ -882,13 +958,29 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 )
                 _telegram_update_cache[update_id] = "done"
                 return
-        except Exception:
+        except Exception as error:
             logger.exception(
                 "Telegram callback processing failed",
                 platform="telegram",
                 telegram_event_type="callback",
+                interaction_status="render_failed",
                 update_id=update_id,
+                error_type=type(error).__name__,
             )
+            try:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text=TELEGRAM_FRIENDLY_ERROR_TEXT,
+                    message_thread_id=parsed.get("message_thread_id"),
+                )
+            except Exception:
+                logger.exception(
+                    "Telegram callback fallback message failed",
+                    platform="telegram",
+                    telegram_event_type="callback",
+                    update_id=update_id,
+                )
         finally:
             _telegram_update_cache[update_id] = "done"
         return
@@ -1117,6 +1209,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
         logger.info(
             "Telegram message processed",
             platform="telegram",
+            telegram_event_type="message",
             user_id=str(user_id),
             thread_id=thread_id,
             duration_ms=duration_ms,
@@ -1130,6 +1223,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
         logger.exception(
             "Telegram message processing failed",
             platform="telegram",
+            telegram_event_type="message",
             user_id=str(user_id),
             thread_id=thread_id,
             duration_ms=duration_ms,
@@ -2119,6 +2213,14 @@ async def telegram_webhook(
     parsed = _parse_telegram_update(payload)
     if not parsed:
         return {"ok": True, "ignored": "unsupported_update"}
+
+    if parsed.get("event_type") == "callback":
+        callback_data = parsed.get("data") or ""
+        if _parse_callback_data(callback_data) is None:
+            return {
+                "ok": True,
+                "ignored": "unsupported_callback_payload",
+            }
 
     _telegram_update_cache[update_id] = "processing"
     try:
