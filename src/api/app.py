@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -115,6 +116,9 @@ TELEGRAM_UNSUPPORTED_ERROR_TEXT = (
     "I couldn't complete that request as phrased. "
     "Please try rewording it with the area, dataset, or time range you want."
 )
+TELEGRAM_CALLBACK_PREFIX = "lz"
+TELEGRAM_CALLBACK_ACTION_CHART = "chart"
+TELEGRAM_CALLBACK_ACTION_MAP = "map"
 
 # Idempotency cache for Telegram update IDs
 # values: processing | done
@@ -447,6 +451,37 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text.strip()
 
 
+def _generate_interaction_token() -> str:
+    return secrets.token_urlsafe(9)
+
+
+def _encode_callback_data(action: str, token: str) -> str:
+    return f"{TELEGRAM_CALLBACK_PREFIX}:{action}:{token}"
+
+
+def _build_telegram_artifact_keyboard(token: str) -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Show Map",
+                    "callback_data": _encode_callback_data(
+                        TELEGRAM_CALLBACK_ACTION_MAP,
+                        token,
+                    ),
+                },
+                {
+                    "text": "Show Chart",
+                    "callback_data": _encode_callback_data(
+                        TELEGRAM_CALLBACK_ACTION_CHART,
+                        token,
+                    ),
+                },
+            ]
+        ]
+    }
+
+
 async def _send_telegram_typing(bot_token: str, chat_id: int):
     """Send 'typing...' indicator to the user."""
     url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
@@ -461,6 +496,7 @@ async def _send_telegram_message(
     chat_id: int,
     text: str,
     message_thread_id: Optional[int] = None,
+    reply_markup: Optional[Dict[str, Any]] = None,
 ):
     html_text = _markdown_to_telegram_html(text)
     payload: Dict[str, Any] = {
@@ -471,6 +507,8 @@ async def _send_telegram_message(
     }
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
@@ -552,6 +590,8 @@ async def _run_lite_agent_for_telegram(
     return {
         "text": formatted_text,
         "charts_data": charts_data,
+        "aoi": result.get("aoi"),
+        "dataset": result.get("dataset"),
     }
 
 
@@ -663,6 +703,39 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 text=part,
                 message_thread_id=parsed["message_thread_id"],
             )
+
+        if APISettings.lite_telegram_enable_map_buttons:
+            token = _generate_interaction_token()
+            _telegram_interaction_cache[token] = {
+                "chat_id": parsed["chat_id"],
+                "message_thread_id": parsed["message_thread_id"],
+                "user_id": user_id,
+                "query": parsed["text"],
+                "summary_text": final_text,
+                "aoi": result.get("aoi"),
+                "dataset": result.get("dataset"),
+                "charts_data": result.get("charts_data") or [],
+                "created_at": time.time(),
+            }
+            await _send_telegram_message(
+                bot_token=APISettings.telegram_bot_token,
+                chat_id=parsed["chat_id"],
+                text="Choose what you want to see:",
+                message_thread_id=parsed["message_thread_id"],
+                reply_markup=_build_telegram_artifact_keyboard(token),
+            )
+
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "Telegram message processed",
+                platform="telegram",
+                telegram_event_type="message",
+                user_id=str(user_id),
+                thread_id=thread_id,
+                duration_ms=duration_ms,
+                status="ok",
+            )
+            return
 
         chart_select_ms = 0
         chart_render_ms = 0
