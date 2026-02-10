@@ -5,7 +5,9 @@ from langchain_openai import ChatOpenAI
 
 from src.agent.config import AgentSettings
 
-load_dotenv()
+# Load .env first, then override with .env.local
+load_dotenv(".env")
+load_dotenv(".env.local", override=True)
 
 # Anthropic
 SONNET = ChatAnthropic(

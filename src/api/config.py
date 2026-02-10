@@ -32,6 +32,21 @@ class _APISettings(BaseSettings):
         default=False, alias="ALLOW_ANONYMOUS_CHAT"
     )
 
+    # Lite / Telegram settings
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_webhook_secret: str = Field(
+        default="", alias="TELEGRAM_WEBHOOK_SECRET"
+    )
+    lite_max_response_words: int = Field(
+        default=300, alias="LITE_MAX_RESPONSE_WORDS"
+    )
+    lite_telegram_message_char_limit: int = Field(
+        default=4096, alias="LITE_TELEGRAM_MESSAGE_CHAR_LIMIT"
+    )
+    lite_enable_model_rewrite: bool = Field(
+        default=True, alias="LITE_ENABLE_MODEL_REWRITE"
+    )
+
     @property
     def domains_allowlist(self) -> list[str]:
         if not self.domains_allowlist_str.strip():

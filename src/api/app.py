@@ -1,10 +1,14 @@
+import asyncio
+import html as html_mod
 import io
 import json
 import os
+import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import cachetools
@@ -95,6 +99,20 @@ logger = get_logger(__name__)
 NEXTJS_API_KEY_HEADER = "X-API-KEY"
 NEXTJS_IP_HEADER = "X-ZENO-FORWARDED-FOR"
 ANONYMOUS_USER_PREFIX = "noauth"
+TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+TELEGRAM_MAX_MESSAGE_CHARS = 4096
+TELEGRAM_FRIENDLY_ERROR_TEXT = (
+    "Sorry — I ran into a temporary issue while processing that. "
+    "Please try again in a moment."
+)
+TELEGRAM_UNSUPPORTED_ERROR_TEXT = (
+    "I couldn't complete that request as phrased. "
+    "Please try rewording it with the area, dataset, or time range you want."
+)
+
+# Idempotency cache for Telegram update IDs
+# values: processing | done
+_telegram_update_cache = cachetools.TTLCache(maxsize=100_000, ttl=60 * 60 * 24)
 
 
 @asynccontextmanager
@@ -199,6 +217,379 @@ signer = TimestampSigner(os.environ["COOKIE_SIGNER_SECRET_KEY"])
 
 def pack(data):
     return json.dumps(data) + "\n"
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return content["text"]
+        return ""
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+
+    return ""
+
+
+def _extract_final_agent_text(agent_result: Dict[str, Any]) -> str:
+    messages = agent_result.get("messages", [])
+
+    for message in reversed(messages):
+        if isinstance(message, dict):
+            message_type = message.get("type") or message.get("role")
+            if message_type in {"ai", "assistant"}:
+                content = _message_content_to_text(message.get("content", ""))
+                if content and content.strip():
+                    return content.strip()
+            continue
+
+        message_type = getattr(message, "type", None)
+        if message_type == "ai":
+            content = _message_content_to_text(getattr(message, "content", ""))
+            if content and content.strip():
+                return content.strip()
+
+    insights = agent_result.get("insights") or []
+    if insights:
+        return str(insights[-1]).strip()
+
+    return "I wasn't able to produce a full answer for that request yet."
+
+
+def _rewrite_lite_response(text: str, max_words: int = 300) -> str:
+    cleaned = text.strip()
+
+    # Remove UI-specific language
+    ui_patterns = [
+        r"(?im)^.*\b(click|tap)\b.*\b(map|panel|sidebar|button)\b.*$",
+        r"(?im)^.*\b(open)\b.*\b(map|panel|sidebar)\b.*$",
+    ]
+    for pattern in ui_patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    words = cleaned.split()
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words]).rstrip(" ,.;:") + "…"
+
+    return cleaned
+
+
+async def _format_lite_response_hybrid(text: str, max_words: int = 300) -> str:
+    deterministic = _rewrite_lite_response(text, max_words=max_words)
+
+    if not deterministic:
+        return "I couldn't find enough information to answer that yet."
+
+    if not APISettings.lite_enable_model_rewrite:
+        return deterministic
+
+    prompt = f"""Rewrite the following assistant response for Telegram.
+
+Requirements:
+- Keep meaning faithful to the source response.
+- Maximum {max_words} words.
+- Prefer short paragraphs and bullet points.
+- Remove UI references such as clicking/opening maps or panels.
+- Do not include code blocks or JSON.
+- Keep the same language as the source response.
+
+Source response:
+{deterministic}
+"""
+
+    try:
+        model = get_small_model()
+        llm_response = await model.ainvoke(prompt)
+        llm_text = _message_content_to_text(getattr(llm_response, "content", ""))
+        final_text = _rewrite_lite_response(llm_text, max_words=max_words)
+        return final_text or deterministic
+    except Exception as e:
+        logger.warning(
+            "Lite model rewrite failed, using deterministic formatter",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return deterministic
+
+
+def _split_text_for_telegram(
+    text: str,
+    max_chars: int = TELEGRAM_MAX_MESSAGE_CHARS,
+) -> List[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: List[str] = []
+    remaining = text
+
+    while len(remaining) > max_chars:
+        slice_at = max_chars
+        window = remaining[:max_chars]
+
+        for separator in ["\n\n", "\n", ". ", " "]:
+            candidate = window.rfind(separator)
+            if candidate > int(max_chars * 0.6):
+                slice_at = candidate + len(separator)
+                break
+
+        chunk = remaining[:slice_at].strip()
+        if not chunk:
+            chunk = remaining[:max_chars].strip()
+            slice_at = max_chars
+
+        chunks.append(chunk)
+        remaining = remaining[slice_at:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    if len(chunks) == 1:
+        return chunks
+
+    numbered_chunks: List[str] = []
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        prefix = f"({idx}/{total})\n"
+        allowed = max_chars - len(prefix)
+        numbered_chunks.append(prefix + chunk[:allowed])
+
+    return numbered_chunks
+
+
+def _markdown_to_telegram_html(text: str) -> str:
+    """Convert markdown formatting to Telegram-compatible HTML."""
+    # Remove horizontal rules
+    text = re.sub(r"^-{3,}$", "", text, flags=re.MULTILINE)
+
+    # Process line by line for bullet conversion and headings
+    lines = text.split("\n")
+    result_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Convert markdown headings to bold
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if heading_match:
+            result_lines.append(f"<b>{html_mod.escape(heading_match.group(2))}</b>")
+            continue
+        # Convert markdown bullet points to unicode bullets
+        bullet_match = re.match(r"^[\*\-]\s+(.+)$", stripped)
+        if bullet_match:
+            result_lines.append(f"  \u2022 {bullet_match.group(1)}")
+            continue
+        result_lines.append(line)
+
+    text = "\n".join(result_lines)
+
+    # Convert bold **text** to <b>text</b> (do before escaping)
+    # Extract bold segments, escape everything, then re-insert tags
+    bold_parts = []
+    def _capture_bold(m):
+        bold_parts.append(m.group(1))
+        return f"\x00BOLD{len(bold_parts) - 1}\x00"
+
+    text = re.sub(r"\*\*(.+?)\*\*", _capture_bold, text)
+
+    # Convert italic *text* to <i>text</i>
+    italic_parts = []
+    def _capture_italic(m):
+        italic_parts.append(m.group(1))
+        return f"\x00ITALIC{len(italic_parts) - 1}\x00"
+
+    text = re.sub(r"\*(.+?)\*", _capture_italic, text)
+
+    # Escape HTML entities in the rest
+    text = html_mod.escape(text)
+
+    # Re-insert bold/italic tags
+    for i, part in enumerate(bold_parts):
+        text = text.replace(f"\x00BOLD{i}\x00", f"<b>{html_mod.escape(part)}</b>")
+    for i, part in enumerate(italic_parts):
+        text = text.replace(f"\x00ITALIC{i}\x00", f"<i>{html_mod.escape(part)}</i>")
+
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+async def _send_telegram_typing(bot_token: str, chat_id: int):
+    """Send 'typing...' indicator to the user."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json={"chat_id": chat_id, "action": "typing"}, timeout=5)
+
+
+async def _send_telegram_message(
+    bot_token: str,
+    chat_id: int,
+    text: str,
+    message_thread_id: Optional[int] = None,
+):
+    html_text = _markdown_to_telegram_html(text)
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, timeout=15)
+        if response.status_code == 400:
+            # Fallback to plain text if HTML parsing fails
+            payload["text"] = text
+            del payload["parse_mode"]
+            response = await client.post(url, json=payload, timeout=15)
+        response.raise_for_status()
+
+
+async def _run_lite_agent_for_telegram(
+    query: str,
+    thread_id: str,
+    user_id: int,
+) -> str:
+    zeno_async = await fetch_zeno(channel="lite")
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "metadata": {
+            "channel": "lite",
+            "platform": "telegram",
+            "platform_user_id": str(user_id),
+            "ui_context": None,
+        },
+    }
+
+    state_updates = {
+        "messages": [HumanMessage(content=query)],
+        "user_persona": None,
+    }
+
+    result = await zeno_async.ainvoke(state_updates, config=config)
+    final_text = _extract_final_agent_text(result)
+    return await _format_lite_response_hybrid(
+        final_text,
+        max_words=APISettings.lite_max_response_words,
+    )
+
+
+def _parse_telegram_update(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    message = payload.get("message")
+    if not message:
+        return None
+
+    text = message.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    from_user = message.get("from") or {}
+    chat = message.get("chat") or {}
+    user_id = from_user.get("id")
+    chat_id = chat.get("id")
+
+    if user_id is None or chat_id is None:
+        return None
+
+    return {
+        "user_id": int(user_id),
+        "chat_id": int(chat_id),
+        "message_thread_id": message.get("message_thread_id"),
+        "text": text.strip(),
+    }
+
+
+def _telegram_error_message_and_category(error: Exception) -> tuple[str, str]:
+    if isinstance(error, (httpx.TimeoutException, TimeoutError, ConnectionError)):
+        return TELEGRAM_FRIENDLY_ERROR_TEXT, "transient"
+    if isinstance(error, ValueError):
+        return TELEGRAM_UNSUPPORTED_ERROR_TEXT, "unsupported"
+    return TELEGRAM_FRIENDLY_ERROR_TEXT, "internal"
+
+
+async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
+    started = time.perf_counter()
+    user_id = parsed["user_id"]
+    thread_id = f"telegram:{user_id}"
+
+    try:
+        await _send_telegram_typing(APISettings.telegram_bot_token, parsed["chat_id"])
+        final_text = await _run_lite_agent_for_telegram(
+            query=parsed["text"],
+            thread_id=thread_id,
+            user_id=user_id,
+        )
+        parts = _split_text_for_telegram(
+            final_text,
+            max_chars=APISettings.lite_telegram_message_char_limit,
+        )
+
+        for part in parts:
+            await _send_telegram_message(
+                bot_token=APISettings.telegram_bot_token,
+                chat_id=parsed["chat_id"],
+                text=part,
+                message_thread_id=parsed["message_thread_id"],
+            )
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "Telegram message processed",
+            platform="telegram",
+            user_id=str(user_id),
+            thread_id=thread_id,
+            duration_ms=duration_ms,
+            status="ok",
+        )
+
+    except Exception as e:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        message, failure_category = _telegram_error_message_and_category(e)
+
+        logger.exception(
+            "Telegram message processing failed",
+            platform="telegram",
+            user_id=str(user_id),
+            thread_id=thread_id,
+            duration_ms=duration_ms,
+            status="error",
+            error_type=type(e).__name__,
+            failure_category=failure_category,
+        )
+
+        try:
+            if APISettings.telegram_bot_token:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text=message,
+                    message_thread_id=parsed["message_thread_id"],
+                )
+        except Exception:
+            logger.exception(
+                "Failed to send Telegram friendly error message",
+                platform="telegram",
+                user_id=str(user_id),
+                thread_id=thread_id,
+                failure_category=failure_category,
+            )
+    finally:
+        _telegram_update_cache[update_id] = "done"
 
 
 async def replay_chat(thread_id):
@@ -1120,6 +1511,57 @@ async def chat(
             thread_id=chat_request.thread_id,
         )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/lite/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(
+        default=None,
+        alias=TELEGRAM_SECRET_HEADER,
+    ),
+):
+    if not APISettings.telegram_webhook_secret:
+        logger.error("Telegram webhook secret is not configured")
+        raise HTTPException(status_code=503, detail="Telegram not configured")
+
+    if not APISettings.telegram_bot_token:
+        logger.error("Telegram bot token is not configured")
+        raise HTTPException(status_code=503, detail="Telegram not configured")
+
+    if x_telegram_bot_api_secret_token != APISettings.telegram_webhook_secret:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    update_id = payload.get("update_id")
+    if update_id is None:
+        return {"ok": True, "ignored": "missing_update_id"}
+
+    if update_id in _telegram_update_cache:
+        logger.info(
+            "Telegram duplicate update ignored",
+            platform="telegram",
+            update_id=update_id,
+            status="dedup",
+        )
+        return {"ok": True, "dedup": True}
+
+    parsed = _parse_telegram_update(payload)
+    if not parsed:
+        return {"ok": True, "ignored": "unsupported_update"}
+
+    _telegram_update_cache[update_id] = "processing"
+    try:
+        asyncio.create_task(_process_telegram_update(update_id, parsed))
+    except Exception:
+        _telegram_update_cache.pop(update_id, None)
+        raise HTTPException(status_code=500, detail="Failed to schedule update")
+
+    return {"ok": True, "accepted": True}
 
 
 @app.get("/api/threads", response_model=list[ThreadModel])

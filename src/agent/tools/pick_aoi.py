@@ -148,10 +148,8 @@ async def query_aoi_database(
                 WHERE name IS NOT NULL AND name % :place_name
             """
             )
-        if "custom" in existing_tables:
+        if "custom" in existing_tables and user_id:
             src_id = SOURCE_ID_MAPPING["custom"]["id_column"]
-            if not user_id:
-                raise ValueError("user_id required for custom areas")
             union_parts.append(
                 f"""
                 SELECT CAST({src_id} as TEXT) as src_id,

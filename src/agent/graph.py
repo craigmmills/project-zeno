@@ -27,8 +27,22 @@ from src.shared.logging_config import get_logger
 logger = get_logger(__name__)
 
 
-def get_prompt(user: Optional[dict] = None) -> str:
-    """Generate the prompt with current date. (Ignore user information)"""
+def get_prompt(user: Optional[dict] = None, channel: Optional[str] = None) -> str:
+    """Generate the prompt with current date and optional channel instructions."""
+    channel_instructions = ""
+    if channel == "lite":
+        channel_instructions = """
+LITE CHANNEL INSTRUCTIONS (messaging app context):
+- Be maximally proactive. Never ask for clarification when you can make a reasonable assumption.
+- If the user omits a date range, pick a sensible default (e.g. "last 5 years" for trends, "last 3 months" for recent activity). Never ask for YYYY-MM-DD format.
+- If the user's query is vague on dataset, pick the most relevant one and go.
+- Keep responses short: lead with the key numbers/findings in 1-3 sentences, then a few bullets of detail. Target ~150 words.
+- Do NOT include "further exploration" suggestions, follow-up idea lists, or "what you could do next" sections.
+- Keep caveats to one short sentence at most. Skip them entirely if they are standard disclaimers the user likely already knows.
+- Avoid UI/web references like map clicks, side panels, or buttons.
+- Do not use greetings, filler, or emoji.
+"""
+
     return f"""You are a Global Nature Watch's Geospatial Agent with access to tools and user provided selections. Think step-by-step to help answer user queries.
 
 CRITICAL INSTRUCTIONS:
@@ -107,6 +121,7 @@ GENERAL NOTES:
 - Use markdown formatting for giving structure and increase readability of your response. Include empty lines between sections and paragraphs to improve readability.
 - Never include json data or code blocks in your response. The data is rendered from the state updates directly, separately from your own response.
 
+{channel_instructions}
 {WORDING_INSTRUCTIONS}
 """
 
@@ -119,7 +134,9 @@ tools = [
     generate_insights,
 ]
 
-load_dotenv()
+# Load .env first, then override with .env.local
+load_dotenv(".env")
+load_dotenv(".env.local", override=True)
 
 
 DATABASE_URL = os.environ["DATABASE_URL"].replace(
@@ -185,6 +202,7 @@ async def handle_tool_errors(request, handler):
 
 async def fetch_zeno_anonymous(
     user: Optional[dict] = None,
+    channel: Optional[str] = None,
 ) -> CompiledStateGraph:
     """Setup the Zeno agent for anonymous users with the provided tools and prompt."""
     # async with AsyncPostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
@@ -194,13 +212,16 @@ async def fetch_zeno_anonymous(
         model=MODEL,
         tools=tools,
         state_schema=AgentState,
-        system_prompt=get_prompt(user),
+        system_prompt=get_prompt(user, channel=channel),
         middleware=[handle_tool_errors],
     )
     return zeno_agent
 
 
-async def fetch_zeno(user: Optional[dict] = None) -> CompiledStateGraph:
+async def fetch_zeno(
+    user: Optional[dict] = None,
+    channel: Optional[str] = None,
+) -> CompiledStateGraph:
     """Setup the Zeno agent with the provided tools and prompt."""
 
     checkpointer = await fetch_checkpointer()
@@ -208,7 +229,7 @@ async def fetch_zeno(user: Optional[dict] = None) -> CompiledStateGraph:
         model=MODEL,
         tools=tools,
         state_schema=AgentState,
-        system_prompt=get_prompt(user),
+        system_prompt=get_prompt(user, channel=channel),
         middleware=[handle_tool_errors],
         checkpointer=checkpointer,
     )
