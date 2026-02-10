@@ -558,6 +558,35 @@ async def _run_lite_agent_for_telegram(
 def _parse_telegram_update(
     payload: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
+    callback_query = payload.get("callback_query")
+    if callback_query:
+        callback_message = callback_query.get("message") or {}
+        callback_user = callback_query.get("from") or {}
+        callback_chat = callback_message.get("chat") or {}
+
+        callback_query_id = callback_query.get("id")
+        callback_data = callback_query.get("data")
+        user_id = callback_user.get("id")
+        chat_id = callback_chat.get("id")
+
+        if (
+            callback_query_id is None
+            or not isinstance(callback_data, str)
+            or user_id is None
+            or chat_id is None
+        ):
+            return None
+
+        return {
+            "event_type": "callback",
+            "callback_query_id": str(callback_query_id),
+            "chat_id": int(chat_id),
+            "message_id": callback_message.get("message_id"),
+            "message_thread_id": callback_message.get("message_thread_id"),
+            "user_id": int(user_id),
+            "data": callback_data,
+        }
+
     message = payload.get("message")
     if not message:
         return None
@@ -575,6 +604,7 @@ def _parse_telegram_update(
         return None
 
     return {
+        "event_type": "message",
         "user_id": int(user_id),
         "chat_id": int(chat_id),
         "message_thread_id": message.get("message_thread_id"),
@@ -594,6 +624,19 @@ def _telegram_error_message_and_category(error: Exception) -> tuple[str, str]:
 
 async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
     started = time.perf_counter()
+    event_type = parsed.get("event_type", "message")
+
+    if event_type == "callback":
+        logger.info(
+            "Telegram callback update accepted",
+            platform="telegram",
+            telegram_event_type="callback",
+            status="accepted",
+            update_id=update_id,
+        )
+        _telegram_update_cache[update_id] = "done"
+        return
+
     user_id = parsed["user_id"]
     thread_id = f"telegram:{user_id}"
 
