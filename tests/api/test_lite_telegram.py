@@ -1,15 +1,19 @@
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from src.api.app import (
     TELEGRAM_FRIENDLY_ERROR_TEXT,
+    _markdown_to_telegram_html,
     _normalize_map_dataset,
     _parse_telegram_update,
     _process_telegram_update,
     _rewrite_lite_response,
     _run_lite_agent_for_telegram,
+    _send_telegram_message,
     _split_text_for_telegram,
+    _strip_markdown_to_plain_text,
     _telegram_interaction_cache,
     _telegram_update_cache,
 )
@@ -558,6 +562,63 @@ def test_split_text_for_telegram_splits_and_numbers_parts():
     assert len(parts) > 1
     assert parts[0].startswith("(1/")
     assert all(len(part) <= 1000 for part in parts)
+
+
+def test_markdown_to_telegram_html_converts_common_markers():
+    text = "# Summary\n- **Bold** and _italic_\n+ __More bold__"
+    rendered = _markdown_to_telegram_html(text)
+
+    assert "<b>Summary</b>" in rendered
+    assert "• <b>Bold</b> and <i>italic</i>" in rendered
+    assert "• <b>More bold</b>" in rendered
+    assert "**" not in rendered
+    assert "__" not in rendered
+    assert "```" not in rendered
+
+
+def test_strip_markdown_to_plain_text_removes_markup_tokens():
+    text = (
+        "# Title\n"
+        "> quote\n"
+        "- **Bold** and _italic_ with `code`\n"
+        "[label](https://example.com)\n"
+        "```python\nprint('x')\n```\n"
+        "__more__"
+    )
+
+    plain = _strip_markdown_to_plain_text(text)
+
+    assert "Title" in plain
+    assert "quote" in plain
+    assert "• Bold and italic with code" in plain
+    assert "label (https://example.com)" in plain
+    assert "print('x')" in plain
+    assert "**" not in plain
+    assert "__" not in plain
+    assert "```" not in plain
+
+
+async def test_send_telegram_message_400_retry_uses_plain_text_fallback():
+    request = httpx.Request("POST", "https://api.telegram.org/botx/sendMessage")
+    first = httpx.Response(400, request=request, text="Bad Request")
+    second = httpx.Response(200, request=request, json={"ok": True})
+
+    with patch(
+        "src.api.app.httpx.AsyncClient.post",
+        new=AsyncMock(side_effect=[first, second]),
+    ) as post:
+        await _send_telegram_message(
+            bot_token="test-token",
+            chat_id=123,
+            text="**Bold** and _italic_",
+        )
+
+    assert post.await_count == 2
+    second_payload = post.await_args_list[1].kwargs["json"]
+    assert "parse_mode" not in second_payload
+    assert second_payload["text"] == "Bold and italic"
+    assert "**" not in second_payload["text"]
+    assert "__" not in second_payload["text"]
 
 
 async def test_run_lite_agent_uses_lite_channel_and_returns_context():

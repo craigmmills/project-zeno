@@ -403,65 +403,118 @@ def _split_text_for_telegram(
     return numbered_chunks
 
 
+def _strip_markdown_to_plain_text(text: str) -> str:
+    """Strip markdown tokens while preserving readable plain text."""
+    text = re.sub(r"(?m)^```[^\n]*\n?", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    text = re.sub(r"(?m)^\s*[-\*+]\s+", "• ", text)
+    text = re.sub(r"(?m)^\s*>\s?", "", text)
+
+    emphasis_patterns = [
+        r"\*\*(.+?)\*\*",
+        r"__(.+?)__",
+        r"\*(.+?)\*",
+        r"_(.+?)_",
+    ]
+    for pattern in emphasis_patterns:
+        text = re.sub(pattern, r"\1", text)
+
+    text = text.replace("```", "")
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+    text = text.replace("`", "")
+    text = re.sub(r"(?<!\w)\*(?!\w)", "", text)
+    text = re.sub(r"(?<!\w)_(?!\w)", "", text)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _cleanup_stray_markdown_markers(text: str) -> str:
+    text = text.replace("```", "")
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+    text = text.replace("`", "")
+    text = re.sub(r"(?<!\w)\*(?!\w)", "", text)
+    text = re.sub(r"(?<!\w)_(?!\w)", "", text)
+    return text
+
+
 def _markdown_to_telegram_html(text: str) -> str:
     """Convert markdown formatting to Telegram-compatible HTML."""
-    # Remove horizontal rules
-    text = re.sub(r"^-{3,}$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"(?m)^-{3,}\s*$", "", text)
 
-    # Process line by line for bullet conversion and headings
     lines = text.split("\n")
-    result_lines = []
+    normalized_lines = []
     for line in lines:
         stripped = line.strip()
-        # Convert markdown headings to bold
+
         heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
         if heading_match:
-            result_lines.append(
-                f"<b>{html_mod.escape(heading_match.group(2))}</b>"
-            )
+            normalized_lines.append(f"**{heading_match.group(2)}**")
             continue
-        # Convert markdown bullet points to unicode bullets
-        bullet_match = re.match(r"^[\*\-]\s+(.+)$", stripped)
+
+        bullet_match = re.match(r"^[-\*+]\s+(.+)$", stripped)
         if bullet_match:
-            result_lines.append(f"  \u2022 {bullet_match.group(1)}")
+            normalized_lines.append(f"• {bullet_match.group(1)}")
             continue
-        result_lines.append(line)
 
-    text = "\n".join(result_lines)
+        quote_match = re.match(r"^>\s?(.*)$", stripped)
+        if quote_match:
+            normalized_lines.append(quote_match.group(1))
+            continue
 
-    # Convert bold **text** to <b>text</b> (do before escaping)
-    # Extract bold segments, escape everything, then re-insert tags
-    bold_parts = []
+        normalized_lines.append(line)
 
-    def _capture_bold(m):
-        bold_parts.append(m.group(1))
-        return f"\x00BOLD{len(bold_parts) - 1}\x00"
+    text = "\n".join(normalized_lines)
 
-    text = re.sub(r"\*\*(.+?)\*\*", _capture_bold, text)
+    tokens: List[str] = []
 
-    # Convert italic *text* to <i>text</i>
-    italic_parts = []
+    def _stash(html_fragment: str) -> str:
+        token = f"\x00TG{len(tokens)}\x00"
+        tokens.append(html_fragment)
+        return token
 
-    def _capture_italic(m):
-        italic_parts.append(m.group(1))
-        return f"\x00ITALIC{len(italic_parts) - 1}\x00"
+    text = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: _stash(
+            f"{html_mod.escape(m.group(1))} ({html_mod.escape(m.group(2))})"
+        ),
+        text,
+    )
+    text = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: _stash(f"<code>{html_mod.escape(m.group(1))}</code>"),
+        text,
+    )
+    text = re.sub(
+        r"\*\*(.+?)\*\*",
+        lambda m: _stash(f"<b>{html_mod.escape(m.group(1))}</b>"),
+        text,
+    )
+    text = re.sub(
+        r"__(.+?)__",
+        lambda m: _stash(f"<b>{html_mod.escape(m.group(1))}</b>"),
+        text,
+    )
+    text = re.sub(
+        r"(?<!\*)\*([^\n*]+?)\*(?!\*)",
+        lambda m: _stash(f"<i>{html_mod.escape(m.group(1))}</i>"),
+        text,
+    )
+    text = re.sub(
+        r"(?<!_)_([^\n_]+?)_(?!_)",
+        lambda m: _stash(f"<i>{html_mod.escape(m.group(1))}</i>"),
+        text,
+    )
 
-    text = re.sub(r"\*(.+?)\*", _capture_italic, text)
-
-    # Escape HTML entities in the rest
     text = html_mod.escape(text)
+    for idx, fragment in enumerate(tokens):
+        text = text.replace(f"\x00TG{idx}\x00", fragment)
 
-    # Re-insert bold/italic tags
-    for i, part in enumerate(bold_parts):
-        text = text.replace(
-            f"\x00BOLD{i}\x00", f"<b>{html_mod.escape(part)}</b>"
-        )
-    for i, part in enumerate(italic_parts):
-        text = text.replace(
-            f"\x00ITALIC{i}\x00", f"<i>{html_mod.escape(part)}</i>"
-        )
-
-    # Collapse excessive blank lines
+    text = _cleanup_stray_markdown_markers(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
@@ -616,9 +669,14 @@ async def _send_telegram_message(
     async with httpx.AsyncClient() as client:
         response = await client.post(url, json=payload, timeout=15)
         if response.status_code == 400:
-            # Fallback to plain text if HTML parsing fails
-            payload["text"] = text
-            del payload["parse_mode"]
+            logger.warning(
+                "Telegram sendMessage HTML failed, retrying plain text",
+                status_code=response.status_code,
+                response_body=response.text[:500],
+            )
+            fallback_text = _strip_markdown_to_plain_text(text)
+            payload["text"] = fallback_text or text
+            payload.pop("parse_mode", None)
             response = await client.post(url, json=payload, timeout=15)
         response.raise_for_status()
 
