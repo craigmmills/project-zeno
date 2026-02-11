@@ -4,6 +4,7 @@ import pytest
 
 from src.api.app import (
     TELEGRAM_FRIENDLY_ERROR_TEXT,
+    _build_telegram_chart_caption,
     _normalize_map_dataset,
     _parse_telegram_update,
     _process_telegram_update,
@@ -253,7 +254,7 @@ async def test_failure_text_with_chart_candidate_still_shows_buttons():
     assert _telegram_interaction_cache.get("tok456") is not None
 
 
-async def test_callback_chart_flow_sends_photo():
+async def test_callback_chart_flow_uses_short_caption_not_insight():
     token = "charttok"
     chart = {
         "id": "main_chart",
@@ -301,6 +302,9 @@ async def test_callback_chart_flow_sends_photo():
 
     callback_answer.assert_awaited_once()
     send_photo.assert_awaited_once()
+    _, kwargs = send_photo.await_args
+    assert kwargs["caption"] == "Trend"
+    assert "Insight" not in kwargs["caption"]
 
 
 async def test_callback_map_flow_sends_photo():
@@ -558,6 +562,120 @@ def test_split_text_for_telegram_splits_and_numbers_parts():
     assert len(parts) > 1
     assert parts[0].startswith("(1/")
     assert all(len(part) <= 1000 for part in parts)
+
+
+def test_build_telegram_chart_caption_prefers_title_and_truncates():
+    APISettings.lite_chart_caption_max_chars = 18
+    chart = {
+        "title": "  Forest   loss \n trend in   Amazon basin  ",
+        "type": "line",
+    }
+
+    caption = _build_telegram_chart_caption(chart)
+
+    assert caption == "Forest loss trend"
+
+
+def test_build_telegram_chart_caption_falls_back_when_title_missing():
+    chart = {
+        "type": "line",
+    }
+
+    caption = _build_telegram_chart_caption(chart)
+
+    assert caption == "Line chart"
+
+
+async def test_non_button_mode_chart_only_skips_summary_text():
+    APISettings.lite_telegram_enable_map_buttons = False
+    parsed = {
+        "event_type": "message",
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+    chart = {
+        "id": "main_chart",
+        "type": "line",
+        "title": "Trend",
+        "insight": "Long insight that should not be used.",
+        "data": [{"year": 2020, "value": 1}],
+        "xAxis": "year",
+        "yAxis": "value",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={
+                    "text": "Result",
+                    "charts_data": [chart],
+                    "aoi": None,
+                    "dataset": None,
+                }
+            ),
+        ),
+        patch(
+            "src.api.app.select_best_chart_with_debug",
+            return_value=(chart, []),
+        ),
+        patch("src.api.app.render_chart_png", return_value=b"PNG"),
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=3005, parsed=parsed)
+
+    send_photo.assert_awaited_once()
+    send_message.assert_not_called()
+
+
+async def test_non_button_mode_falls_back_to_text_when_chart_not_sent():
+    APISettings.lite_telegram_enable_map_buttons = False
+    parsed = {
+        "event_type": "message",
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={
+                    "text": "Result",
+                    "charts_data": [{"id": "c1", "type": "line"}],
+                    "aoi": None,
+                    "dataset": None,
+                }
+            ),
+        ),
+        patch(
+            "src.api.app.select_best_chart_with_debug",
+            return_value=(None, []),
+        ),
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=3006, parsed=parsed)
+
+    send_photo.assert_not_called()
+    send_message.assert_awaited_once()
+    _, kwargs = send_message.await_args
+    assert kwargs["text"] == "Result"
 
 
 async def test_run_lite_agent_uses_lite_channel_and_returns_context():
