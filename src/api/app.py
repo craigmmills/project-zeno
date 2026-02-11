@@ -583,6 +583,42 @@ def _normalize_map_dataset(dataset: Any) -> dict | None:
     return normalized or None
 
 
+def _clean_caption_part(value: Any) -> str:
+    if value is None:
+        return ""
+
+    cleaned = re.sub(r"\s+", " ", str(value)).strip()
+    cleaned = cleaned.strip(" -–—,:;.!?/")
+    return cleaned
+
+
+def _build_telegram_map_caption(context: Dict[str, Any]) -> str:
+    dataset_name = ""
+    dataset = context.get("dataset")
+    if isinstance(dataset, dict):
+        dataset_name = _clean_caption_part(dataset.get("dataset_name"))
+
+    aoi_name = ""
+    aoi = context.get("aoi")
+    if isinstance(aoi, dict):
+        aoi_name = _clean_caption_part(aoi.get("name") or aoi.get("src_id"))
+
+    if dataset_name and aoi_name:
+        caption = f"{dataset_name} - {aoi_name}"
+    elif dataset_name:
+        caption = dataset_name
+    elif aoi_name:
+        caption = aoi_name
+    else:
+        caption = "Map"
+
+    max_chars = APISettings.lite_map_caption_max_chars
+    if max_chars > 0:
+        caption = caption[:max_chars]
+    caption = _clean_caption_part(caption)
+    return caption or "Map"
+
+
 async def _send_telegram_typing(bot_token: str, chat_id: int):
     """Send 'typing...' indicator to the user."""
     url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
@@ -1034,10 +1070,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
 
                 map_render_ms = int((time.perf_counter() - map_started) * 1000)
 
-                map_caption = str(context.get("summary_text") or "")
-                map_caption = map_caption[
-                    : APISettings.lite_map_caption_max_chars
-                ]
+                map_caption = _build_telegram_map_caption(context)
 
                 await _send_telegram_photo(
                     bot_token=APISettings.telegram_bot_token,

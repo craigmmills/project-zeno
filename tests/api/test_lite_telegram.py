@@ -4,6 +4,7 @@ import pytest
 
 from src.api.app import (
     TELEGRAM_FRIENDLY_ERROR_TEXT,
+    _build_telegram_map_caption,
     _normalize_map_dataset,
     _parse_telegram_update,
     _process_telegram_update,
@@ -337,6 +338,8 @@ async def test_callback_map_flow_sends_photo():
         await _process_telegram_update(update_id=102, parsed=parsed)
 
     send_photo.assert_awaited_once()
+    _, kwargs = send_photo.await_args
+    assert kwargs["caption"] == "Dataset - BRA"
 
 
 async def test_callback_map_with_missing_tile_url_still_sends_photo():
@@ -376,6 +379,8 @@ async def test_callback_map_with_missing_tile_url_still_sends_photo():
         await _process_telegram_update(update_id=1021, parsed=parsed)
 
     send_photo.assert_awaited_once()
+    _, kwargs = send_photo.await_args
+    assert kwargs["caption"] == "Dataset only - BRA"
     send_message.assert_not_called()
 
 
@@ -413,8 +418,83 @@ async def test_callback_map_with_non_dict_dataset_safely_handled():
         await _process_telegram_update(update_id=1022, parsed=parsed)
 
     send_photo.assert_awaited_once()
+    _, send_kwargs = send_photo.await_args
+    assert send_kwargs["caption"] == "BRA"
     _, kwargs = render_map.await_args
     assert kwargs["dataset"] is None
+
+
+def test_build_telegram_map_caption_prefers_dataset_and_aoi():
+    caption = _build_telegram_map_caption(
+        {
+            "summary_text": "Very long summary that should be ignored",
+            "dataset": {"dataset_name": "Tree cover loss"},
+            "aoi": {"name": "Spain", "src_id": "ESP"},
+        }
+    )
+
+    assert caption == "Tree cover loss - Spain"
+
+
+def test_build_telegram_map_caption_fallback_dataset_only():
+    caption = _build_telegram_map_caption(
+        {
+            "dataset": {"dataset_name": " Natural lands "},
+            "aoi": {},
+        }
+    )
+
+    assert caption == "Natural lands"
+
+
+def test_build_telegram_map_caption_fallback_aoi_only():
+    caption = _build_telegram_map_caption(
+        {
+            "dataset": None,
+            "aoi": {"name": "", "src_id": "BRA"},
+        }
+    )
+
+    assert caption == "BRA"
+
+
+def test_build_telegram_map_caption_fallback_map_literal():
+    caption = _build_telegram_map_caption(
+        {
+            "dataset": "not-a-dict",
+            "aoi": None,
+        }
+    )
+
+    assert caption == "Map"
+
+
+def test_build_telegram_map_caption_truncates_to_setting():
+    old_max = APISettings.lite_map_caption_max_chars
+    APISettings.lite_map_caption_max_chars = 10
+    try:
+        caption = _build_telegram_map_caption(
+            {
+                "dataset": {"dataset_name": "Very long dataset name"},
+                "aoi": {"name": "Spain"},
+            }
+        )
+    finally:
+        APISettings.lite_map_caption_max_chars = old_max
+
+    assert caption == "Very long"
+
+
+def test_build_telegram_map_caption_ignores_summary_text():
+    caption = _build_telegram_map_caption(
+        {
+            "summary_text": "This should not appear in caption",
+            "dataset": {"dataset_name": "Dataset"},
+            "aoi": {"src_id": "BRA"},
+        }
+    )
+
+    assert caption == "Dataset - BRA"
 
 
 def test_normalize_map_dataset_keeps_safe_trimmed_fields():

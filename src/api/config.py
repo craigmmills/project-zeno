@@ -65,7 +65,7 @@ class _APISettings(BaseSettings):
         default=1024, alias="LITE_CHART_CAPTION_MAX_CHARS"
     )
     lite_map_caption_max_chars: int = Field(
-        default=1024, alias="LITE_MAP_CAPTION_MAX_CHARS"
+        default=80, alias="LITE_MAP_CAPTION_MAX_CHARS"
     )
     lite_chart_render_dpi: int = Field(
         default=180, alias="LITE_CHART_RENDER_DPI"
