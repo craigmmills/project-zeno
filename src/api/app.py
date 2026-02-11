@@ -505,6 +505,21 @@ def _parse_callback_data(data: str) -> Optional[tuple[str, str]]:
     return action, token
 
 
+def _normalize_map_dataset(dataset: Any) -> dict | None:
+    if not isinstance(dataset, dict):
+        return None
+
+    normalized: dict[str, str] = {}
+    for key in ["dataset_name", "tile_url", "dataset_id"]:
+        value = dataset.get(key)
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed:
+                normalized[key] = trimmed
+
+    return normalized or None
+
+
 async def _send_telegram_typing(bot_token: str, chat_id: int):
     """Send 'typing...' indicator to the user."""
     url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
@@ -888,11 +903,27 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                     _telegram_update_cache[update_id] = "done"
                     return
 
+                normalized_dataset = _normalize_map_dataset(
+                    context.get("dataset")
+                )
+                logger.debug(
+                    "Telegram callback map dataset normalized",
+                    platform="telegram",
+                    telegram_event_type="callback",
+                    interaction_action="map",
+                    dataset_tile_url_present=bool(
+                        normalized_dataset
+                        and normalized_dataset.get("tile_url")
+                    ),
+                    dataset_present=isinstance(context.get("dataset"), dict),
+                    update_id=update_id,
+                )
+
                 map_started = time.perf_counter()
                 try:
                     map_png = await render_map_png(
                         aoi=aoi,
-                        dataset=context.get("dataset"),
+                        dataset=normalized_dataset,
                         width_px=APISettings.lite_chart_width_px,
                         height_px=APISettings.lite_chart_height_px,
                         dpi=APISettings.lite_chart_render_dpi,
@@ -937,7 +968,9 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 map_render_ms = int((time.perf_counter() - map_started) * 1000)
 
                 map_caption = str(context.get("summary_text") or "")
-                map_caption = map_caption[: APISettings.lite_map_caption_max_chars]
+                map_caption = map_caption[
+                    : APISettings.lite_map_caption_max_chars
+                ]
 
                 await _send_telegram_photo(
                     bot_token=APISettings.telegram_bot_token,

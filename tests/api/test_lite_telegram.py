@@ -4,6 +4,7 @@ import pytest
 
 from src.api.app import (
     TELEGRAM_FRIENDLY_ERROR_TEXT,
+    _normalize_map_dataset,
     _parse_telegram_update,
     _process_telegram_update,
     _rewrite_lite_response,
@@ -103,7 +104,9 @@ async def test_message_flow_sends_buttons_not_auto_chart():
         patch(
             "src.api.app._send_telegram_message", new=AsyncMock()
         ) as send_message,
-        patch("src.api.app._send_telegram_photo", new=AsyncMock()) as send_photo,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
     ):
         await _process_telegram_update(update_id=100, parsed=parsed)
 
@@ -155,7 +158,9 @@ async def test_callback_chart_flow_sends_photo():
             return_value=(chart, []),
         ),
         patch("src.api.app.render_chart_png", return_value=b"PNG"),
-        patch("src.api.app._send_telegram_photo", new=AsyncMock()) as send_photo,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
     ):
         await _process_telegram_update(update_id=101, parsed=parsed)
 
@@ -186,15 +191,116 @@ async def test_callback_map_flow_sends_photo():
     }
 
     with (
+        patch("src.api.app._send_telegram_callback_answer", new=AsyncMock()),
         patch(
-            "src.api.app._send_telegram_callback_answer", new=AsyncMock()
+            "src.api.app.render_map_png", new=AsyncMock(return_value=b"PNG")
         ),
-        patch("src.api.app.render_map_png", new=AsyncMock(return_value=b"PNG")),
-        patch("src.api.app._send_telegram_photo", new=AsyncMock()) as send_photo,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
     ):
         await _process_telegram_update(update_id=102, parsed=parsed)
 
     send_photo.assert_awaited_once()
+
+
+async def test_callback_map_with_missing_tile_url_still_sends_photo():
+    token = "map-no-tiles"
+    _telegram_interaction_cache[token] = {
+        "chat_id": 2,
+        "message_thread_id": None,
+        "user_id": 1,
+        "query": "map",
+        "summary_text": "summary",
+        "aoi": {"source": "gadm", "src_id": "BRA"},
+        "dataset": {"dataset_name": "Dataset only"},
+        "charts_data": [],
+        "created_at": 0,
+    }
+    parsed = {
+        "event_type": "callback",
+        "callback_query_id": "cb2b",
+        "chat_id": 2,
+        "message_thread_id": None,
+        "user_id": 1,
+        "data": f"lz:map:{token}",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_callback_answer", new=AsyncMock()),
+        patch(
+            "src.api.app.render_map_png", new=AsyncMock(return_value=b"PNG")
+        ),
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=1021, parsed=parsed)
+
+    send_photo.assert_awaited_once()
+    send_message.assert_not_called()
+
+
+async def test_callback_map_with_non_dict_dataset_safely_handled():
+    token = "map-bad-dataset"
+    _telegram_interaction_cache[token] = {
+        "chat_id": 2,
+        "message_thread_id": None,
+        "user_id": 1,
+        "query": "map",
+        "summary_text": "summary",
+        "aoi": {"source": "gadm", "src_id": "BRA"},
+        "dataset": "dataset-string",
+        "charts_data": [],
+        "created_at": 0,
+    }
+    parsed = {
+        "event_type": "callback",
+        "callback_query_id": "cb2c",
+        "chat_id": 2,
+        "message_thread_id": None,
+        "user_id": 1,
+        "data": f"lz:map:{token}",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_callback_answer", new=AsyncMock()),
+        patch(
+            "src.api.app.render_map_png", new=AsyncMock(return_value=b"PNG")
+        ) as render_map,
+        patch(
+            "src.api.app._send_telegram_photo", new=AsyncMock()
+        ) as send_photo,
+    ):
+        await _process_telegram_update(update_id=1022, parsed=parsed)
+
+    send_photo.assert_awaited_once()
+    _, kwargs = render_map.await_args
+    assert kwargs["dataset"] is None
+
+
+def test_normalize_map_dataset_keeps_safe_trimmed_fields():
+    normalized = _normalize_map_dataset(
+        {
+            "dataset_name": "  Tree cover loss  ",
+            "tile_url": "  https://tiles/{z}/{x}/{y}.png  ",
+            "dataset_id": "  umd-glad  ",
+            "extra": "drop-me",
+        }
+    )
+
+    assert normalized == {
+        "dataset_name": "Tree cover loss",
+        "tile_url": "https://tiles/{z}/{x}/{y}.png",
+        "dataset_id": "umd-glad",
+    }
+
+
+def test_normalize_map_dataset_returns_none_for_non_dict():
+    assert _normalize_map_dataset("bad") is None
 
 
 async def test_callback_expired_token_sends_friendly_message():
@@ -208,10 +314,10 @@ async def test_callback_expired_token_sends_friendly_message():
     }
 
     with (
+        patch("src.api.app._send_telegram_callback_answer", new=AsyncMock()),
         patch(
-            "src.api.app._send_telegram_callback_answer", new=AsyncMock()
-        ),
-        patch("src.api.app._send_telegram_message", new=AsyncMock()) as send_message,
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
     ):
         await _process_telegram_update(update_id=103, parsed=parsed)
 
@@ -368,7 +474,9 @@ async def test_telegram_background_processing_sends_friendly_error_on_failure():
             "src.api.app._run_lite_agent_for_telegram",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ),
-        patch("src.api.app._send_telegram_message", new=AsyncMock()) as send_message,
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
     ):
         await _process_telegram_update(update_id=3004, parsed=parsed)
 
