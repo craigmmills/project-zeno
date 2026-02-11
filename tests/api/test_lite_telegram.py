@@ -211,6 +211,138 @@ async def test_no_artifact_candidates_suppress_buttons():
     assert len(_telegram_interaction_cache) == 0
 
 
+async def test_clarification_question_with_aoi_suppresses_buttons():
+    parsed = {
+        "event_type": "message",
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={
+                    "text": "What time period are you interested in?",
+                    "charts_data": [],
+                    "aoi": {"source": "gadm", "src_id": "BRA"},
+                    "dataset": None,
+                    "raw_data": {},
+                }
+            ),
+        ),
+        patch(
+            "src.api.app._generate_interaction_token",
+            return_value="tok-clarify-1",
+        ) as token,
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+    ):
+        await _process_telegram_update(update_id=107, parsed=parsed)
+
+    token.assert_not_called()
+    assert send_message.await_count == 1
+    assert all(
+        "reply_markup" not in kwargs
+        for _, kwargs in send_message.await_args_list
+    )
+    assert len(_telegram_interaction_cache) == 0
+
+
+async def test_followup_question_with_map_candidate_only_suppresses_buttons():
+    parsed = {
+        "event_type": "message",
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={
+                    "text": "Could you specify which dataset you mean?",
+                    "charts_data": [],
+                    "aoi": {"source": "gadm", "src_id": "BRA"},
+                    "dataset": None,
+                    "raw_data": {},
+                }
+            ),
+        ),
+        patch(
+            "src.api.app._generate_interaction_token",
+            return_value="tok-clarify-2",
+        ) as token,
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+    ):
+        await _process_telegram_update(update_id=108, parsed=parsed)
+
+    token.assert_not_called()
+    assert send_message.await_count == 1
+    assert all(
+        "reply_markup" not in kwargs
+        for _, kwargs in send_message.await_args_list
+    )
+    assert len(_telegram_interaction_cache) == 0
+
+
+async def test_question_text_with_chart_data_still_shows_buttons():
+    parsed = {
+        "event_type": "message",
+        "user_id": 1,
+        "chat_id": 2,
+        "message_thread_id": None,
+        "text": "show trend",
+    }
+    chart = {
+        "id": "main_chart",
+        "type": "line",
+        "title": "Trend",
+        "insight": "Insight",
+        "data": [{"year": 2020, "value": 1}],
+        "xAxis": "year",
+        "yAxis": "value",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_typing", new=AsyncMock()),
+        patch(
+            "src.api.app._run_lite_agent_for_telegram",
+            new=AsyncMock(
+                return_value={
+                    "text": "What time period should I compare in this chart?",
+                    "charts_data": [chart],
+                    "aoi": None,
+                    "dataset": None,
+                    "raw_data": {},
+                }
+            ),
+        ),
+        patch(
+            "src.api.app._generate_interaction_token",
+            return_value="tok-chart-question",
+        ),
+        patch(
+            "src.api.app._send_telegram_message", new=AsyncMock()
+        ) as send_message,
+    ):
+        await _process_telegram_update(update_id=109, parsed=parsed)
+
+    assert send_message.await_count == 2
+    _, kwargs = send_message.await_args_list[-1]
+    assert kwargs["reply_markup"]["inline_keyboard"]
+    assert _telegram_interaction_cache.get("tok-chart-question") is not None
+
+
 async def test_failure_text_with_chart_candidate_still_shows_buttons():
     parsed = {
         "event_type": "message",

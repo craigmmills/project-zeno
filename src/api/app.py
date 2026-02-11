@@ -135,6 +135,20 @@ TELEGRAM_NO_DATA_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+TELEGRAM_CLARIFICATION_PATTERNS = (
+    re.compile(r"\bwhat time period\b", re.IGNORECASE),
+    re.compile(r"\bwhich time period\b", re.IGNORECASE),
+    re.compile(r"\bwhich dataset\b", re.IGNORECASE),
+    re.compile(r"\bcan you clarify\b", re.IGNORECASE),
+    re.compile(r"\bcould you specify\b", re.IGNORECASE),
+    re.compile(r"\bdo you mean\b", re.IGNORECASE),
+    re.compile(r"\bwhich\s+(country|region|area)\b", re.IGNORECASE),
+    re.compile(r"\bbefore i continue\b", re.IGNORECASE),
+    re.compile(
+        r"\bto proceed,?\s+(please\s+)?(specify|confirm)\b",
+        re.IGNORECASE,
+    ),
+)
 
 # Idempotency cache for Telegram update IDs
 # values: processing | done
@@ -576,6 +590,30 @@ def _is_probable_no_data_response(text: str) -> bool:
     return any(pattern.search(text) for pattern in TELEGRAM_NO_DATA_PATTERNS)
 
 
+def _is_probable_clarification_response(text: str) -> bool:
+    if not text:
+        return False
+
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    if not normalized:
+        return False
+
+    if any(
+        pattern.search(normalized)
+        for pattern in TELEGRAM_CLARIFICATION_PATTERNS
+    ):
+        return True
+
+    lead_ins = (
+        "what",
+        "which",
+        "can you",
+        "could you",
+        "do you",
+    )
+    return "?" in normalized and normalized.startswith(lead_ins)
+
+
 def _has_nonempty_raw_data(raw_data: Any) -> bool:
     if raw_data is None:
         return False
@@ -608,10 +646,14 @@ def _should_show_telegram_artifact_buttons(
     has_data_signal = (
         _has_nonempty_raw_data(result.get("raw_data")) or has_chart_candidate
     )
-    no_data_text = _is_probable_no_data_response(result.get("text") or "")
+    text = result.get("text") or ""
+    no_data_text = _is_probable_no_data_response(text)
+    clarification_text = _is_probable_clarification_response(text)
 
     if not has_chart_candidate and not has_map_candidate:
         return False, "no_artifacts"
+    if clarification_text and not has_data_signal:
+        return False, "clarification_followup"
     if no_data_text and not has_data_signal:
         return False, "failure_text_no_data"
     if has_chart_candidate and has_map_candidate:
@@ -1241,8 +1283,10 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 result.get("charts_data")
             )
             has_map_candidate = _has_map_candidate(result.get("aoi"))
-            no_data_text = _is_probable_no_data_response(
-                result.get("text") or ""
+            result_text = result.get("text") or ""
+            no_data_text = _is_probable_no_data_response(result_text)
+            clarification_text = _is_probable_clarification_response(
+                result_text
             )
             should_show, artifact_buttons_reason = (
                 _should_show_telegram_artifact_buttons(result)
@@ -1263,6 +1307,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                     has_chart_candidate=has_chart_candidate,
                     has_map_candidate=has_map_candidate,
                     no_data_text=no_data_text,
+                    clarification_text=clarification_text,
                 )
                 return
 
@@ -1300,6 +1345,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 has_chart_candidate=has_chart_candidate,
                 has_map_candidate=has_map_candidate,
                 no_data_text=no_data_text,
+                clarification_text=clarification_text,
             )
             return
 
