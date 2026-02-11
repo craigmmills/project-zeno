@@ -654,8 +654,68 @@ def test_normalize_map_dataset_keeps_safe_trimmed_fields():
     }
 
 
+def test_normalize_map_dataset_keeps_int_dataset_id():
+    normalized = _normalize_map_dataset(
+        {
+            "dataset_name": "Grasslands",
+            "tile_url": "https://tiles/{{z}}/{{x}}/{{y}}.png",
+            "dataset_id": 42,
+        }
+    )
+
+    assert normalized == {
+        "dataset_name": "Grasslands",
+        "tile_url": "https://tiles/{{z}}/{{x}}/{{y}}.png",
+        "dataset_id": 42,
+    }
+
+
 def test_normalize_map_dataset_returns_none_for_non_dict():
     assert _normalize_map_dataset("bad") is None
+
+
+async def test_callback_map_flow_passes_normalized_dataset_to_renderer():
+    token = "map-normalized"
+    _telegram_interaction_cache[token] = {
+        "chat_id": 2,
+        "message_thread_id": None,
+        "user_id": 1,
+        "query": "map",
+        "summary_text": "summary",
+        "aoi": {"source": "gadm", "src_id": "BRA"},
+        "dataset": {
+            "dataset_name": "  Grasslands extent  ",
+            "tile_url": "  https://tiles/{{z}}/{{x}}/{{y}}.png  ",
+            "dataset_id": 7,
+            "extra": "drop-me",
+        },
+        "charts_data": [],
+        "created_at": 0,
+    }
+    parsed = {
+        "event_type": "callback",
+        "callback_query_id": "cb-map-normalized",
+        "chat_id": 2,
+        "message_thread_id": None,
+        "user_id": 1,
+        "data": f"lz:map:{token}",
+    }
+
+    with (
+        patch("src.api.app._send_telegram_callback_answer", new=AsyncMock()),
+        patch(
+            "src.api.app.render_map_png", new=AsyncMock(return_value=b"PNG")
+        ) as render_map,
+        patch("src.api.app._send_telegram_photo", new=AsyncMock()),
+    ):
+        await _process_telegram_update(update_id=1023, parsed=parsed)
+
+    _, kwargs = render_map.await_args
+    assert kwargs["dataset"] == {
+        "dataset_name": "Grasslands extent",
+        "tile_url": "https://tiles/{{z}}/{{x}}/{{y}}.png",
+        "dataset_id": 7,
+    }
 
 
 async def test_callback_expired_token_sends_friendly_message():

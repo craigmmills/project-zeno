@@ -85,6 +85,15 @@ class _APISettings(BaseSettings):
         default=2.5, alias="MAPBOX_STATIC_TIMEOUT_SECONDS"
     )
     mapbox_static_scale: int = Field(default=2, alias="MAPBOX_STATIC_SCALE")
+    map_overlay_tile_timeout_seconds: float = Field(
+        default=4.0, alias="MAP_OVERLAY_TILE_TIMEOUT_SECONDS"
+    )
+    map_overlay_tile_retries: int = Field(
+        default=1, alias="MAP_OVERLAY_TILE_RETRIES"
+    )
+    map_overlay_max_concurrency: int = Field(
+        default=8, alias="MAP_OVERLAY_MAX_CONCURRENCY"
+    )
 
     @property
     def domains_allowlist(self) -> list[str]:

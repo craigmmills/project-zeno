@@ -667,13 +667,27 @@ def _normalize_map_dataset(dataset: Any) -> dict | None:
     if not isinstance(dataset, dict):
         return None
 
-    normalized: dict[str, str] = {}
-    for key in ["dataset_name", "tile_url", "dataset_id"]:
-        value = dataset.get(key)
-        if isinstance(value, str):
-            trimmed = value.strip()
-            if trimmed:
-                normalized[key] = trimmed
+    normalized: dict[str, str | int] = {}
+
+    dataset_name = dataset.get("dataset_name")
+    if isinstance(dataset_name, str):
+        trimmed = dataset_name.strip()
+        if trimmed:
+            normalized["dataset_name"] = trimmed
+
+    tile_url = dataset.get("tile_url")
+    if isinstance(tile_url, str):
+        trimmed = tile_url.strip()
+        if trimmed:
+            normalized["tile_url"] = trimmed
+
+    dataset_id = dataset.get("dataset_id")
+    if isinstance(dataset_id, int):
+        normalized["dataset_id"] = dataset_id
+    elif isinstance(dataset_id, str):
+        trimmed = dataset_id.strip()
+        if trimmed:
+            normalized["dataset_id"] = trimmed
 
     return normalized or None
 

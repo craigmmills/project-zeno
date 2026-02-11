@@ -3,6 +3,7 @@ import io
 import math
 import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import geopandas as gpd
 import httpx
@@ -17,8 +18,6 @@ logger = get_logger(__name__)
 
 TILE_SIZE = 256
 MAX_TILE_REQUESTS = 64
-TILE_TIMEOUT_SECONDS = 1.5
-MAX_TILE_CONCURRENCY = 8
 DEFAULT_MAX_ZOOM = 12
 MERCATOR_MAX_LAT = 85.05112878
 
@@ -100,36 +99,72 @@ def _compute_plot_extent(
     return minx - x_pad, miny - y_pad, maxx + x_pad, maxy + y_pad
 
 
-def _resolve_dataset_tile_url(
-    dataset: Optional[dict[str, Any]],
-) -> Optional[str]:
-    if not isinstance(dataset, dict):
-        return None
-
-    raw = dataset.get("tile_url")
-    if not isinstance(raw, str):
-        return None
-
-    tile_url = raw.strip()
-    if not tile_url:
-        return None
-
-    if "{z}" in tile_url and "{x}" in tile_url and "{y}" in tile_url:
-        return tile_url
-
-    normalized = _normalize_xyz_template(tile_url)
-    if "{z}" in normalized and "{x}" in normalized and "{y}" in normalized:
-        return normalized
-
-    return None
-
-
 def _normalize_xyz_template(url: str) -> str:
     return (
         url.replace("{{z}}", "{z}")
         .replace("{{x}}", "{x}")
         .replace("{{y}}", "{y}")
     )
+
+
+def _resolve_dataset_tile_url_details(
+    dataset: Optional[dict[str, Any]],
+) -> tuple[Optional[str], str, dict[str, Any]]:
+    details = {
+        "template_has_z": False,
+        "template_has_x": False,
+        "template_has_y": False,
+        "template_normalized": False,
+    }
+    if not isinstance(dataset, dict):
+        return None, "missing_tile_url", details
+
+    raw = dataset.get("tile_url")
+    if not isinstance(raw, str):
+        return None, "missing_tile_url", details
+
+    tile_url = raw.strip()
+    if not tile_url:
+        return None, "missing_tile_url", details
+
+    normalized = _normalize_xyz_template(tile_url)
+    details["template_normalized"] = normalized != tile_url
+    details["template_has_z"] = "{z}" in normalized
+    details["template_has_x"] = "{x}" in normalized
+    details["template_has_y"] = "{y}" in normalized
+
+    if not (
+        details["template_has_z"]
+        and details["template_has_x"]
+        and details["template_has_y"]
+    ):
+        return None, "unresolved_xyz_placeholders", details
+
+    if "{" in normalized or "}" in normalized:
+        leftovers = ["{z}", "{x}", "{y}"]
+        stripped = normalized
+        for part in leftovers:
+            stripped = stripped.replace(part, "")
+        if "{" in stripped or "}" in stripped:
+            return None, "malformed_template", details
+
+    return normalized, "ok", details
+
+
+def _resolve_dataset_tile_url(
+    dataset: Optional[dict[str, Any]],
+) -> Optional[str]:
+    tile_url, _, _ = _resolve_dataset_tile_url_details(dataset)
+    return tile_url
+
+
+def _extract_tile_host(url_template: Optional[str]) -> Optional[str]:
+    if not isinstance(url_template, str) or not url_template:
+        return None
+    try:
+        return urlparse(url_template).netloc or None
+    except Exception:
+        return None
 
 
 def _clamp_lat(lat: float) -> float:
@@ -329,6 +364,15 @@ def _create_blank_canvas(width_px: int, height_px: int) -> Image.Image:
     )
 
 
+def _is_retryable_tile_error(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code >= 500
+    return False
+
+
 async def _download_tiles(
     url_template: str,
     z: int,
@@ -336,7 +380,8 @@ async def _download_tiles(
     y_range: range,
     timeout_s: float,
     concurrency: int,
-) -> dict[tuple[int, int], Image.Image]:
+    retries: int = 0,
+) -> tuple[dict[tuple[int, int], Image.Image], dict[str, int]]:
     semaphore = asyncio.Semaphore(max(concurrency, 1))
     timeout = httpx.Timeout(timeout_s)
 
@@ -344,18 +389,30 @@ async def _download_tiles(
         client: httpx.AsyncClient,
         x: int,
         y: int,
-    ) -> tuple[tuple[int, int], Optional[Image.Image]]:
+    ) -> tuple[tuple[int, int], Optional[Image.Image], int]:
         url = _tile_url(url_template, z=z, x=x, y=y)
-        try:
-            async with semaphore:
-                response = await client.get(url)
-            response.raise_for_status()
-            image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-            return (x, y), image
-        except Exception:
-            return (x, y), None
+        attempts = 0
+        max_attempts = max(1, retries + 1)
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                async with semaphore:
+                    response = await client.get(url)
+                response.raise_for_status()
+                image = Image.open(io.BytesIO(response.content)).convert(
+                    "RGBA"
+                )
+                return (x, y), image, attempts
+            except Exception as exc:
+                if attempts >= max_attempts or not _is_retryable_tile_error(
+                    exc
+                ):
+                    return (x, y), None, attempts
+
+        return (x, y), None, attempts
 
     tiles: dict[tuple[int, int], Image.Image] = {}
+    retry_attempts = 0
     async with httpx.AsyncClient(
         timeout=timeout, follow_redirects=True
     ) as client:
@@ -364,11 +421,14 @@ async def _download_tiles(
             for y in y_range
             for x in x_range
         ]
-        for key, image in await asyncio.gather(*tasks):
+        for key, image, attempts in await asyncio.gather(*tasks):
+            retry_attempts += max(0, attempts - 1)
             if image is not None:
                 tiles[key] = image
 
-    return tiles
+    return tiles, {
+        "retry_attempts": retry_attempts,
+    }
 
 
 def _compose_mosaic(
@@ -537,24 +597,56 @@ async def _render_data_overlay_image(
     tile_grid_result: Optional[tuple[int, int, int, int]] = None,
 ) -> tuple[Optional[Image.Image], dict[str, Any]]:
     started = time.perf_counter()
+    overlay_timeout_s = max(
+        float(APISettings.map_overlay_tile_timeout_seconds),
+        0.1,
+    )
+    overlay_concurrency = max(int(APISettings.map_overlay_max_concurrency), 1)
+    overlay_retries = max(int(APISettings.map_overlay_tile_retries), 0)
+
+    dataset_name = ""
+    dataset_id: str | int | None = None
+    if isinstance(dataset, dict):
+        dataset_name = str(dataset.get("dataset_name") or "").strip()
+        raw_dataset_id = dataset.get("dataset_id")
+        if isinstance(raw_dataset_id, (int, str)):
+            dataset_id = raw_dataset_id
+
     metrics: dict[str, Any] = {
         "attempted": False,
         "used": False,
         "reason": None,
         "zoom": None,
+        "zoom_selected": None,
+        "zoom_fallback_used": False,
         "tile_count_requested": 0,
         "tile_count_success": 0,
+        "tile_host": None,
+        "dataset_name": dataset_name,
+        "dataset_id": dataset_id,
+        "template_has_z": False,
+        "template_has_x": False,
+        "template_has_y": False,
+        "template_normalized": False,
+        "overlay_timeout_s": overlay_timeout_s,
+        "overlay_retries_configured": overlay_retries,
+        "overlay_retries_attempted": 0,
+        "overlay_max_concurrency": overlay_concurrency,
     }
 
-    tile_template = _resolve_dataset_tile_url(dataset)
+    tile_template, resolve_reason, resolve_details = (
+        _resolve_dataset_tile_url_details(dataset)
+    )
+    metrics.update(resolve_details)
+    metrics["tile_host"] = _extract_tile_host(tile_template)
+
     if not tile_template:
-        metrics["reason"] = "missing_tile_url"
+        metrics["reason"] = resolve_reason
         metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
         return None, metrics
 
     try:
         metrics["attempted"] = True
-        tile_template = _normalize_xyz_template(tile_template)
         if zoom is None:
             zoom = _pick_zoom(
                 bounds4326=bounds,
@@ -562,25 +654,71 @@ async def _render_data_overlay_image(
                 height_px=height_px,
                 max_zoom=DEFAULT_MAX_ZOOM,
             )
-        metrics["zoom"] = zoom
+
+        selected_zoom = zoom
+        metrics["zoom_selected"] = selected_zoom
+        metrics["zoom"] = selected_zoom
 
         if tile_grid_result is not None:
             x_min, x_max, y_min, y_max = tile_grid_result
         else:
-            x_min, x_max, y_min, y_max = _tile_grid(bounds, zoom)
-        metrics["tile_count_requested"] = (x_max - x_min + 1) * (
-            y_max - y_min + 1
-        )
+            x_min, x_max, y_min, y_max = _tile_grid(bounds, selected_zoom)
+        requested_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
 
-        tiles = await _download_tiles(
+        download_result = await _download_tiles(
             url_template=tile_template,
-            z=zoom,
+            z=selected_zoom,
             x_range=range(x_min, x_max + 1),
             y_range=range(y_min, y_max + 1),
-            timeout_s=TILE_TIMEOUT_SECONDS,
-            concurrency=MAX_TILE_CONCURRENCY,
+            timeout_s=overlay_timeout_s,
+            concurrency=overlay_concurrency,
+            retries=overlay_retries,
         )
+        if isinstance(download_result, tuple):
+            tiles, download_metrics = download_result
+        else:
+            tiles, download_metrics = download_result, {}
+
+        metrics["tile_count_requested"] = requested_tiles
         metrics["tile_count_success"] = len(tiles)
+        metrics["overlay_retries_attempted"] += int(
+            download_metrics.get("retry_attempts", 0)
+        )
+
+        if metrics["tile_count_success"] == 0 and selected_zoom > 0:
+            fallback_zoom = selected_zoom - 1
+            x_min, x_max, y_min, y_max = _tile_grid(bounds, fallback_zoom)
+            fallback_requested = (x_max - x_min + 1) * (y_max - y_min + 1)
+            fallback_result = await _download_tiles(
+                url_template=tile_template,
+                z=fallback_zoom,
+                x_range=range(x_min, x_max + 1),
+                y_range=range(y_min, y_max + 1),
+                timeout_s=overlay_timeout_s,
+                concurrency=overlay_concurrency,
+                retries=overlay_retries,
+            )
+            if isinstance(fallback_result, tuple):
+                fallback_tiles, fallback_metrics = fallback_result
+            else:
+                fallback_tiles, fallback_metrics = fallback_result, {}
+
+            metrics["overlay_retries_attempted"] += int(
+                fallback_metrics.get("retry_attempts", 0)
+            )
+            metrics["zoom_fallback_used"] = True
+            metrics["tile_count_requested"] += fallback_requested
+
+            if fallback_tiles:
+                tiles = fallback_tiles
+                metrics["tile_count_success"] = len(fallback_tiles)
+                metrics["zoom"] = fallback_zoom
+            else:
+                metrics["reason"] = "tile_download_total_failure"
+                metrics["duration_ms"] = int(
+                    (time.perf_counter() - started) * 1000
+                )
+                return None, metrics
 
         if metrics["tile_count_success"] == 0:
             metrics["reason"] = "tile_download_total_failure"
@@ -589,20 +727,22 @@ async def _render_data_overlay_image(
             )
             return None, metrics
 
+        used_zoom = int(metrics.get("zoom") or selected_zoom)
+        used_grid = (x_min, x_max, y_min, y_max)
         mosaic = _compose_mosaic(
             tiles=tiles,
-            x_min=x_min,
-            x_max=x_max,
-            y_min=y_min,
-            y_max=y_max,
+            x_min=used_grid[0],
+            x_max=used_grid[1],
+            y_min=used_grid[2],
+            y_max=used_grid[3],
             tile_size=TILE_SIZE,
         )
         cropped = _crop_mosaic_to_bounds(
             mosaic=mosaic,
             bounds4326=bounds,
-            z=zoom,
-            x_min=x_min,
-            y_min=y_min,
+            z=used_zoom,
+            x_min=used_grid[0],
+            y_min=used_grid[2],
         )
         overlay = cropped.resize(
             (max(width_px, 1), max(height_px, 1)),
@@ -619,6 +759,9 @@ async def _render_data_overlay_image(
             "Map overlay generation failed",
             error=str(exc),
             error_type=type(exc).__name__,
+            dataset_name=dataset_name,
+            dataset_id=dataset_id,
+            tile_host=metrics.get("tile_host"),
         )
         metrics["reason"] = "overlay_exception"
         metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
@@ -681,14 +824,19 @@ async def _render_basemap_image(
             scale=max(1, min(scale, 2)),
         )
 
-        tiles = await _download_tiles(
+        download_result = await _download_tiles(
             url_template=tile_template,
             z=zoom,
             x_range=range(x_min, x_max + 1),
             y_range=range(y_min, y_max + 1),
             timeout_s=timeout_s,
-            concurrency=MAX_TILE_CONCURRENCY,
+            concurrency=max(int(APISettings.map_overlay_max_concurrency), 1),
+            retries=0,
         )
+        if isinstance(download_result, tuple):
+            tiles, _ = download_result
+        else:
+            tiles = download_result
 
         if not tiles:
             metrics["reason"] = "mapbox_tile_fetch_failed"
@@ -878,7 +1026,31 @@ async def render_map_png(
             overlay_attempted=overlay_metrics.get("attempted", False),
             overlay_used=overlay_metrics.get("used", False),
             overlay_reason=overlay_metrics.get("reason"),
-            zoom=overlay_metrics.get("zoom"),
+            overlay_dataset_name=overlay_metrics.get("dataset_name"),
+            overlay_dataset_id=overlay_metrics.get("dataset_id"),
+            overlay_tile_host=overlay_metrics.get("tile_host"),
+            overlay_template_has_z=overlay_metrics.get("template_has_z"),
+            overlay_template_has_x=overlay_metrics.get("template_has_x"),
+            overlay_template_has_y=overlay_metrics.get("template_has_y"),
+            overlay_template_normalized=overlay_metrics.get(
+                "template_normalized"
+            ),
+            overlay_zoom_selected=overlay_metrics.get("zoom_selected"),
+            overlay_zoom_used=overlay_metrics.get("zoom"),
+            overlay_zoom_fallback_used=overlay_metrics.get(
+                "zoom_fallback_used",
+                False,
+            ),
+            overlay_timeout_s=overlay_metrics.get("overlay_timeout_s"),
+            overlay_retries_configured=overlay_metrics.get(
+                "overlay_retries_configured"
+            ),
+            overlay_retries_attempted=overlay_metrics.get(
+                "overlay_retries_attempted"
+            ),
+            overlay_max_concurrency=overlay_metrics.get(
+                "overlay_max_concurrency"
+            ),
             tile_count_requested=overlay_metrics.get(
                 "tile_count_requested", 0
             ),

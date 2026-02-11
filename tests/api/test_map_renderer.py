@@ -39,12 +39,18 @@ def reset_mapbox_settings():
     old_style = APISettings.mapbox_style_id
     old_timeout = APISettings.mapbox_static_timeout_seconds
     old_scale = APISettings.mapbox_static_scale
+    old_overlay_timeout = APISettings.map_overlay_tile_timeout_seconds
+    old_overlay_retries = APISettings.map_overlay_tile_retries
+    old_overlay_concurrency = APISettings.map_overlay_max_concurrency
 
     APISettings.mapbox_access_token = "test-mapbox-token"
     APISettings.mapbox_api_token = ""
     APISettings.mapbox_style_id = "mapbox/dark-v11"
     APISettings.mapbox_static_timeout_seconds = 2.5
     APISettings.mapbox_static_scale = 2
+    APISettings.map_overlay_tile_timeout_seconds = 4.0
+    APISettings.map_overlay_tile_retries = 1
+    APISettings.map_overlay_max_concurrency = 8
 
     yield
 
@@ -53,6 +59,9 @@ def reset_mapbox_settings():
     APISettings.mapbox_style_id = old_style
     APISettings.mapbox_static_timeout_seconds = old_timeout
     APISettings.mapbox_static_scale = old_scale
+    APISettings.map_overlay_tile_timeout_seconds = old_overlay_timeout
+    APISettings.map_overlay_tile_retries = old_overlay_retries
+    APISettings.map_overlay_max_concurrency = old_overlay_concurrency
 
 
 def _mock_geometry():
@@ -91,6 +100,43 @@ def test_build_mapbox_tile_template_1x_scale():
     assert "mapbox/outdoors-v12" in url
     assert "@2x" not in url
     assert "access_token=tok_xyz" in url
+
+
+def test_resolve_dataset_tile_url_accepts_standard_xyz_template():
+    tile_url = mr._resolve_dataset_tile_url(
+        {"tile_url": "https://tiles.example.com/{z}/{x}/{y}.png"}
+    )
+
+    assert tile_url == "https://tiles.example.com/{z}/{x}/{y}.png"
+
+
+def test_resolve_dataset_tile_url_accepts_double_brace_template():
+    tile_url = mr._resolve_dataset_tile_url(
+        {"tile_url": "https://tiles.example.com/{{z}}/{{x}}/{{y}}.png"}
+    )
+
+    assert tile_url == "https://tiles.example.com/{z}/{x}/{y}.png"
+
+
+def test_resolve_dataset_tile_url_rejects_missing_xyz_placeholders():
+    tile_url = mr._resolve_dataset_tile_url(
+        {"tile_url": "https://tiles.example.com/no-xyz.png"}
+    )
+
+    assert tile_url is None
+
+
+def test_resolve_dataset_tile_url_accepts_grasslands_pattern():
+    tile_url = mr._resolve_dataset_tile_url(
+        {
+            "tile_url": (
+                "https://tiles.globalforestwatch.org/"
+                "v1/grasslands/2020/{z}/{x}/{y}.png"
+            )
+        }
+    )
+
+    assert tile_url is not None
 
 
 # ── Unit tests: zoom and tile grid ──
@@ -263,6 +309,99 @@ async def test_render_map_png_overlay_failure_uses_basemap_only():
 
     assert png.startswith(b"\x89PNG")
     render_aoi_only.assert_not_called()
+
+
+async def test_overlay_timeout_retry_success_uses_overlay():
+    fake_tile = Image.new("RGBA", (256, 256), (10, 120, 10, 180))
+
+    with patch(
+        "src.api.map_renderer._download_tiles",
+        new=AsyncMock(
+            return_value=({(0, 0): fake_tile}, {"retry_attempts": 1})
+        ),
+    ):
+        overlay, metrics = await mr._render_data_overlay_image(
+            dataset={
+                "dataset_name": "Grasslands",
+                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
+            },
+            bounds=(-55.0, -10.0, -54.0, -9.0),
+            width_px=300,
+            height_px=200,
+            zoom=0,
+            tile_grid_result=(0, 0, 0, 0),
+        )
+
+    assert overlay is not None
+    assert metrics["used"] is True
+    assert metrics["overlay_retries_attempted"] == 1
+
+
+async def test_overlay_zero_success_falls_back_to_lower_zoom():
+    fake_tile = Image.new("RGBA", (256, 256), (10, 120, 10, 180))
+
+    with patch(
+        "src.api.map_renderer._download_tiles",
+        new=AsyncMock(
+            side_effect=[
+                ({}, {"retry_attempts": 0}),
+                ({(0, 0): fake_tile}, {"retry_attempts": 0}),
+            ]
+        ),
+    ) as mock_download:
+        overlay, metrics = await mr._render_data_overlay_image(
+            dataset={
+                "dataset_name": "Grasslands",
+                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
+            },
+            bounds=(-55.0, -10.0, -54.0, -9.0),
+            width_px=300,
+            height_px=200,
+            zoom=2,
+            tile_grid_result=(0, 0, 0, 0),
+        )
+
+    assert overlay is not None
+    assert metrics["used"] is True
+    assert metrics["zoom_fallback_used"] is True
+    assert metrics["zoom"] == 1
+    assert mock_download.await_count == 2
+
+    first_call = mock_download.await_args_list[0].kwargs
+    second_call = mock_download.await_args_list[1].kwargs
+    assert first_call["z"] == 2
+    assert second_call["z"] == 1
+
+
+async def test_render_map_png_overlay_persistent_failure_falls_back_to_aoi_png():
+    old_access = APISettings.mapbox_access_token
+    old_api = APISettings.mapbox_api_token
+    APISettings.mapbox_access_token = ""
+    APISettings.mapbox_api_token = ""
+
+    try:
+        with (
+            _mock_geometry(),
+            patch(
+                "src.api.map_renderer._download_tiles",
+                new=AsyncMock(return_value=({}, {"retry_attempts": 1})),
+            ),
+        ):
+            png = await render_map_png(
+                aoi={"source": "gadm", "src_id": "BRA"},
+                dataset={
+                    "dataset_name": "Dataset",
+                    "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
+                },
+                width_px=800,
+                height_px=500,
+                dpi=120,
+            )
+    finally:
+        APISettings.mapbox_access_token = old_access
+        APISettings.mapbox_api_token = old_api
+
+    assert png.startswith(b"\x89PNG")
 
 
 async def test_render_map_png_both_fail_falls_back_to_matplotlib():
