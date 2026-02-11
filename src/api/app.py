@@ -124,6 +124,17 @@ TELEGRAM_UNSUPPORTED_ERROR_TEXT = (
 TELEGRAM_CALLBACK_PREFIX = "lz"
 TELEGRAM_CALLBACK_ACTION_CHART = "chart"
 TELEGRAM_CALLBACK_ACTION_MAP = "map"
+TELEGRAM_NO_DATA_PATTERNS = (
+    re.compile(r"couldn't get data", re.IGNORECASE),
+    re.compile(r"could not get data", re.IGNORECASE),
+    re.compile(r"\bno data\b", re.IGNORECASE),
+    re.compile(r"not available", re.IGNORECASE),
+    re.compile(r"unable to", re.IGNORECASE),
+    re.compile(
+        r"tool only allows administrative levels",
+        re.IGNORECASE,
+    ),
+)
 
 # Idempotency cache for Telegram update IDs
 # values: processing | done
@@ -505,6 +516,58 @@ def _parse_callback_data(data: str) -> Optional[tuple[str, str]]:
     return action, token
 
 
+def _is_probable_no_data_response(text: str) -> bool:
+    if not text:
+        return False
+
+    return any(pattern.search(text) for pattern in TELEGRAM_NO_DATA_PATTERNS)
+
+
+def _has_nonempty_raw_data(raw_data: Any) -> bool:
+    if raw_data is None:
+        return False
+    if isinstance(raw_data, str):
+        return bool(raw_data.strip())
+    if isinstance(raw_data, (list, tuple, set, dict)):
+        return len(raw_data) > 0
+    return True
+
+
+def _has_chart_candidate(charts_data: Any) -> bool:
+    if not charts_data:
+        return False
+
+    if isinstance(charts_data, list):
+        return any(bool(chart) for chart in charts_data)
+
+    return bool(charts_data)
+
+
+def _has_map_candidate(aoi: Any) -> bool:
+    return bool(aoi)
+
+
+def _should_show_telegram_artifact_buttons(
+    result: Dict[str, Any],
+) -> tuple[bool, str]:
+    has_chart_candidate = _has_chart_candidate(result.get("charts_data"))
+    has_map_candidate = _has_map_candidate(result.get("aoi"))
+    has_data_signal = (
+        _has_nonempty_raw_data(result.get("raw_data")) or has_chart_candidate
+    )
+    no_data_text = _is_probable_no_data_response(result.get("text") or "")
+
+    if not has_chart_candidate and not has_map_candidate:
+        return False, "no_artifacts"
+    if no_data_text and not has_data_signal:
+        return False, "failure_text_no_data"
+    if has_chart_candidate and has_map_candidate:
+        return True, "both_candidates"
+    if has_chart_candidate:
+        return True, "chart_candidate"
+    return True, "map_candidate"
+
+
 async def _send_telegram_typing(bot_token: str, chat_id: int):
     """Send 'typing...' indicator to the user."""
     url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
@@ -632,6 +695,7 @@ async def _run_lite_agent_for_telegram(
         "charts_data": charts_data,
         "aoi": result.get("aoi"),
         "dataset": result.get("dataset"),
+        "raw_data": result.get("raw_data"),
     }
 
 
@@ -937,7 +1001,9 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 map_render_ms = int((time.perf_counter() - map_started) * 1000)
 
                 map_caption = str(context.get("summary_text") or "")
-                map_caption = map_caption[: APISettings.lite_map_caption_max_chars]
+                map_caption = map_caption[
+                    : APISettings.lite_map_caption_max_chars
+                ]
 
                 await _send_telegram_photo(
                     bot_token=APISettings.telegram_bot_token,
@@ -1013,6 +1079,35 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
             )
 
         if APISettings.lite_telegram_enable_map_buttons:
+            has_chart_candidate = _has_chart_candidate(
+                result.get("charts_data")
+            )
+            has_map_candidate = _has_map_candidate(result.get("aoi"))
+            no_data_text = _is_probable_no_data_response(
+                result.get("text") or ""
+            )
+            should_show, artifact_buttons_reason = (
+                _should_show_telegram_artifact_buttons(result)
+            )
+
+            if not should_show:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                logger.info(
+                    "Telegram message processed",
+                    platform="telegram",
+                    telegram_event_type="message",
+                    user_id=str(user_id),
+                    thread_id=thread_id,
+                    duration_ms=duration_ms,
+                    status="ok",
+                    artifact_buttons_shown=False,
+                    artifact_buttons_reason=artifact_buttons_reason,
+                    has_chart_candidate=has_chart_candidate,
+                    has_map_candidate=has_map_candidate,
+                    no_data_text=no_data_text,
+                )
+                return
+
             token = _generate_interaction_token()
             _telegram_interaction_cache[token] = {
                 "chat_id": parsed["chat_id"],
@@ -1042,6 +1137,11 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 thread_id=thread_id,
                 duration_ms=duration_ms,
                 status="ok",
+                artifact_buttons_shown=True,
+                artifact_buttons_reason=artifact_buttons_reason,
+                has_chart_candidate=has_chart_candidate,
+                has_map_candidate=has_map_candidate,
+                no_data_text=no_data_text,
             )
             return
 
@@ -1214,6 +1314,15 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
             thread_id=thread_id,
             duration_ms=duration_ms,
             status="ok",
+            artifact_buttons_shown=False,
+            artifact_buttons_reason="buttons_disabled",
+            has_chart_candidate=_has_chart_candidate(
+                result.get("charts_data")
+            ),
+            has_map_candidate=_has_map_candidate(result.get("aoi")),
+            no_data_text=_is_probable_no_data_response(
+                result.get("text") or ""
+            ),
         )
 
     except Exception as e:
