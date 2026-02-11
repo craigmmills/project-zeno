@@ -980,6 +980,9 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                         and normalized_dataset.get("tile_url")
                     ),
                     dataset_present=isinstance(context.get("dataset"), dict),
+                    mapbox_token_present=bool(
+                        APISettings.resolved_mapbox_token
+                    ),
                     update_id=update_id,
                 )
 

@@ -75,6 +75,17 @@ class _APISettings(BaseSettings):
         default=750, alias="LITE_CHART_HEIGHT_PX"
     )
 
+    # Map rendering settings
+    mapbox_access_token: str = Field(default="", alias="MAPBOX_ACCESS_TOKEN")
+    mapbox_api_token: str = Field(default="", alias="MAPBOX_API_TOKEN")
+    mapbox_style_id: str = Field(
+        default="mapbox/outdoors-v12", alias="MAPBOX_STYLE_ID"
+    )
+    mapbox_static_timeout_seconds: float = Field(
+        default=2.5, alias="MAPBOX_STATIC_TIMEOUT_SECONDS"
+    )
+    mapbox_static_scale: int = Field(default=2, alias="MAPBOX_STATIC_SCALE")
+
     @property
     def domains_allowlist(self) -> list[str]:
         if not self.domains_allowlist_str.strip():
@@ -82,6 +93,10 @@ class _APISettings(BaseSettings):
         return [
             domain.strip() for domain in self.domains_allowlist_str.split(",")
         ]
+
+    @property
+    def resolved_mapbox_token(self) -> str:
+        return self.mapbox_access_token or self.mapbox_api_token
 
     @field_validator("nextjs_api_key")
     def validate_nextjs_api_key(cls, value):

@@ -9,6 +9,7 @@ import httpx
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
 
+from src.api.config import APISettings
 from src.shared.geocoding_helpers import get_geometry_data
 from src.shared.logging_config import get_logger
 
@@ -20,6 +21,10 @@ TILE_TIMEOUT_SECONDS = 1.5
 MAX_TILE_CONCURRENCY = 8
 DEFAULT_MAX_ZOOM = 12
 MERCATOR_MAX_LAT = 85.05112878
+
+MAPBOX_STATIC_BASE_URL = "https://api.mapbox.com/styles/v1"
+MAPBOX_MAX_DIMENSION = 1280
+MAPBOX_DEFAULT_STYLE = "mapbox/outdoors-v12"
 
 
 class MapRenderError(Exception):
@@ -198,6 +203,128 @@ def _pick_zoom(
 
 def _tile_url(url_template: str, z: int, x: int, y: int) -> str:
     return url_template.format(z=z, x=x, y=y)
+
+
+def _resolve_mapbox_token() -> Optional[str]:
+    token = (APISettings.resolved_mapbox_token or "").strip()
+    if not token:
+        return None
+    return token
+
+
+def _resolve_mapbox_style() -> str:
+    style = (APISettings.mapbox_style_id or "").strip()
+    if not style:
+        return MAPBOX_DEFAULT_STYLE
+    return style
+
+
+def _normalize_static_dims(
+    width_px: int,
+    height_px: int,
+    scale: int,
+) -> tuple[int, int, int]:
+    target_w = max(width_px, 1)
+    target_h = max(height_px, 1)
+    resolved_scale = 2 if int(scale) == 2 else 1
+
+    request_w = max(1, math.ceil(target_w / resolved_scale))
+    request_h = max(1, math.ceil(target_h / resolved_scale))
+
+    ratio = min(
+        1.0,
+        MAPBOX_MAX_DIMENSION / max(request_w, 1),
+        MAPBOX_MAX_DIMENSION / max(request_h, 1),
+    )
+    request_w = max(1, int(math.floor(request_w * ratio)))
+    request_h = max(1, int(math.floor(request_h * ratio)))
+
+    return request_w, request_h, resolved_scale
+
+
+def _build_mapbox_static_url(
+    bounds4326: tuple[float, float, float, float],
+    width_px: int,
+    height_px: int,
+    style_id: str,
+    token: str,
+    scale: int,
+) -> str:
+    min_lon, min_lat, max_lon, max_lat = bounds4326
+    w, h, resolved_scale = _normalize_static_dims(width_px, height_px, scale)
+    scale_suffix = "@2x" if resolved_scale == 2 else ""
+
+    bbox = f"[{min_lon:.6f},{min_lat:.6f},{max_lon:.6f},{max_lat:.6f}]"
+    base = f"{MAPBOX_STATIC_BASE_URL}/{style_id}/static/{bbox}/{w}x{h}{scale_suffix}"
+    query = f"logo=false&attribution=false&access_token={token}"
+    return f"{base}?{query}"
+
+
+async def _download_mapbox_basemap(
+    bounds4326: tuple[float, float, float, float],
+    width_px: int,
+    height_px: int,
+) -> Optional[Image.Image]:
+    token = _resolve_mapbox_token()
+    if not token:
+        return None
+
+    style_id = _resolve_mapbox_style()
+    timeout_s = max(float(APISettings.mapbox_static_timeout_seconds), 0.1)
+    scale = APISettings.mapbox_static_scale
+
+    request_w, request_h, resolved_scale = _normalize_static_dims(
+        width_px=width_px,
+        height_px=height_px,
+        scale=scale,
+    )
+    url = _build_mapbox_static_url(
+        bounds4326=bounds4326,
+        width_px=width_px,
+        height_px=height_px,
+        style_id=style_id,
+        token=token,
+        scale=resolved_scale,
+    )
+
+    timeout = httpx.Timeout(timeout_s)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url)
+        response.raise_for_status()
+    except Exception:
+        return None
+
+    try:
+        basemap = Image.open(io.BytesIO(response.content)).convert("RGBA")
+    except Exception:
+        return None
+
+    expected_w = request_w * resolved_scale
+    expected_h = request_h * resolved_scale
+    if basemap.size != (expected_w, expected_h):
+        basemap = basemap.resize(
+            (expected_w, expected_h),
+            Image.Resampling.BILINEAR,
+        )
+
+    target_w = max(width_px, 1)
+    target_h = max(height_px, 1)
+    if basemap.size != (target_w, target_h):
+        basemap = basemap.resize(
+            (target_w, target_h),
+            Image.Resampling.BILINEAR,
+        )
+
+    return basemap
+
+
+def _create_blank_canvas(width_px: int, height_px: int) -> Image.Image:
+    return Image.new(
+        "RGBA",
+        (max(width_px, 1), max(height_px, 1)),
+        (0, 0, 0, 0),
+    )
 
 
 async def _download_tiles(
@@ -396,6 +523,135 @@ def _render_aoi_only_png(
             plt.close(fig)
 
 
+async def _render_data_overlay_image(
+    dataset: Optional[dict[str, Any]],
+    bounds: tuple[float, float, float, float],
+    width_px: int,
+    height_px: int,
+) -> tuple[Optional[Image.Image], dict[str, Any]]:
+    started = time.perf_counter()
+    metrics: dict[str, Any] = {
+        "attempted": False,
+        "used": False,
+        "reason": None,
+        "zoom": None,
+        "tile_count_requested": 0,
+        "tile_count_success": 0,
+    }
+
+    tile_template = _resolve_dataset_tile_url(dataset)
+    if not tile_template:
+        metrics["reason"] = "missing_tile_url"
+        metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        return None, metrics
+
+    try:
+        metrics["attempted"] = True
+        tile_template = _normalize_xyz_template(tile_template)
+        zoom = _pick_zoom(
+            bounds4326=bounds,
+            width_px=width_px,
+            height_px=height_px,
+            max_zoom=DEFAULT_MAX_ZOOM,
+        )
+        metrics["zoom"] = zoom
+
+        x_min, x_max, y_min, y_max = _tile_grid(bounds, zoom)
+        metrics["tile_count_requested"] = (x_max - x_min + 1) * (
+            y_max - y_min + 1
+        )
+
+        tiles = await _download_tiles(
+            url_template=tile_template,
+            z=zoom,
+            x_range=range(x_min, x_max + 1),
+            y_range=range(y_min, y_max + 1),
+            timeout_s=TILE_TIMEOUT_SECONDS,
+            concurrency=MAX_TILE_CONCURRENCY,
+        )
+        metrics["tile_count_success"] = len(tiles)
+
+        if metrics["tile_count_success"] == 0:
+            metrics["reason"] = "tile_download_total_failure"
+            metrics["duration_ms"] = int(
+                (time.perf_counter() - started) * 1000
+            )
+            return None, metrics
+
+        mosaic = _compose_mosaic(
+            tiles=tiles,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            tile_size=TILE_SIZE,
+        )
+        cropped = _crop_mosaic_to_bounds(
+            mosaic=mosaic,
+            bounds4326=bounds,
+            z=zoom,
+            x_min=x_min,
+            y_min=y_min,
+        )
+        overlay = cropped.resize(
+            (max(width_px, 1), max(height_px, 1)),
+            Image.Resampling.BILINEAR,
+        )
+
+        metrics["used"] = True
+        if metrics["tile_count_success"] < metrics["tile_count_requested"]:
+            metrics["reason"] = "tile_download_partial_failure"
+        metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        return overlay, metrics
+    except Exception as exc:
+        logger.warning(
+            "Map overlay generation failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        metrics["reason"] = "overlay_exception"
+        metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        return None, metrics
+
+
+async def _render_basemap_image(
+    bounds: tuple[float, float, float, float],
+    width_px: int,
+    height_px: int,
+) -> tuple[Optional[Image.Image], dict[str, Any]]:
+    started = time.perf_counter()
+    token = _resolve_mapbox_token()
+    style_id = _resolve_mapbox_style()
+    timeout_s = max(float(APISettings.mapbox_static_timeout_seconds), 0.1)
+
+    metrics: dict[str, Any] = {
+        "attempted": bool(token),
+        "used": False,
+        "reason": None,
+        "mapbox_style_id": style_id,
+        "mapbox_timeout_s": timeout_s,
+    }
+
+    if not token:
+        metrics["reason"] = "missing_mapbox_token"
+        metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        return None, metrics
+
+    basemap = await _download_mapbox_basemap(
+        bounds4326=bounds,
+        width_px=width_px,
+        height_px=height_px,
+    )
+    if basemap is None:
+        metrics["reason"] = "mapbox_fetch_failed"
+        metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        return None, metrics
+
+    metrics["used"] = True
+    metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
+    return basemap, metrics
+
+
 async def render_map_png(
     aoi: dict,
     dataset: Optional[dict],
@@ -427,95 +683,30 @@ async def render_map_png(
     if isinstance(dataset, dict):
         dataset_name = str(dataset.get("dataset_name") or "").strip()
 
-    overlay_attempted = False
-    overlay_used = False
-    zoom: Optional[int] = None
-    tile_count_requested = 0
-    tile_count_success = 0
-    fallback_reason: Optional[str] = None
-    overlay_started = time.perf_counter()
+    render_started = time.perf_counter()
+    basemap_metrics: dict[str, Any] = {}
+    overlay_metrics: dict[str, Any] = {}
+    render_path = "aoi_only_matplotlib"
 
     try:
-        tile_template = _resolve_dataset_tile_url(dataset)
-        if tile_template:
-            overlay_attempted = True
-            tile_template = _normalize_xyz_template(tile_template)
-            zoom = _pick_zoom(
-                bounds4326=bounds,
+        (basemap_result, overlay_result) = await asyncio.gather(
+            _render_basemap_image(
+                bounds=bounds,
                 width_px=width_px,
                 height_px=height_px,
-                max_zoom=DEFAULT_MAX_ZOOM,
-            )
-            x_min, x_max, y_min, y_max = _tile_grid(bounds, zoom)
-            tile_count_requested = (x_max - x_min + 1) * (y_max - y_min + 1)
-
-            tiles = await _download_tiles(
-                url_template=tile_template,
-                z=zoom,
-                x_range=range(x_min, x_max + 1),
-                y_range=range(y_min, y_max + 1),
-                timeout_s=TILE_TIMEOUT_SECONDS,
-                concurrency=MAX_TILE_CONCURRENCY,
-            )
-            tile_count_success = len(tiles)
-
-            if tile_count_success == 0:
-                fallback_reason = "tile_download_total_failure"
-            else:
-                mosaic = _compose_mosaic(
-                    tiles=tiles,
-                    x_min=x_min,
-                    x_max=x_max,
-                    y_min=y_min,
-                    y_max=y_max,
-                    tile_size=TILE_SIZE,
-                )
-                cropped = _crop_mosaic_to_bounds(
-                    mosaic=mosaic,
-                    bounds4326=bounds,
-                    z=zoom,
-                    x_min=x_min,
-                    y_min=y_min,
-                )
-                resized = cropped.resize(
-                    (max(width_px, 1), max(height_px, 1)),
-                    Image.Resampling.BILINEAR,
-                )
-                _draw_aoi_boundary_on_image(
-                    image=resized,
-                    gdf=gdf,
-                    bounds4326=bounds,
-                )
-
-                buf = io.BytesIO()
-                resized.save(buf, format="PNG")
-                overlay_used = True
-                return buf.getvalue()
-        else:
-            fallback_reason = "missing_tile_url"
-
-        if overlay_attempted and fallback_reason is None:
-            fallback_reason = "overlay_unavailable"
-
-        return _render_aoi_only_png(
-            gdf=gdf,
-            bounds=bounds,
-            dataset_name=dataset_name,
-            aoi_name=aoi_name,
-            width_px=width_px,
-            height_px=height_px,
-            dpi=dpi,
+            ),
+            _render_data_overlay_image(
+                dataset=dataset,
+                bounds=bounds,
+                width_px=width_px,
+                height_px=height_px,
+            ),
         )
-    except MapRenderUnsupported:
-        raise
-    except Exception as exc:
-        logger.exception(
-            "Map overlay render failed; falling back to AOI-only",
-            error=str(exc),
-            error_type=type(exc).__name__,
-        )
-        try:
-            fallback_reason = fallback_reason or "overlay_exception"
+        basemap_image, basemap_metrics = basemap_result
+        overlay_image, overlay_metrics = overlay_result
+
+        if basemap_image is None and overlay_image is None:
+            render_path = "aoi_only_matplotlib"
             return _render_aoi_only_png(
                 gdf=gdf,
                 bounds=bounds,
@@ -523,21 +714,80 @@ async def render_map_png(
                 aoi_name=aoi_name,
                 width_px=width_px,
                 height_px=height_px,
-                dpi=dpi,
+                dpi=max(dpi, 1),
+            )
+
+        if basemap_image is not None:
+            canvas = basemap_image.copy()
+        else:
+            canvas = _create_blank_canvas(
+                width_px=width_px, height_px=height_px
+            )
+
+        if overlay_image is not None:
+            canvas.alpha_composite(overlay_image)
+
+        _draw_aoi_boundary_on_image(
+            image=canvas,
+            gdf=gdf,
+            bounds4326=bounds,
+        )
+
+        if basemap_image is not None and overlay_image is not None:
+            render_path = "basemap_overlay_boundary"
+        elif basemap_image is not None:
+            render_path = "basemap_boundary"
+        else:
+            render_path = "overlay_boundary"
+
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        return buf.getvalue()
+    except MapRenderUnsupported:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Map render failed before fallback",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        try:
+            render_path = "aoi_only_matplotlib"
+            return _render_aoi_only_png(
+                gdf=gdf,
+                bounds=bounds,
+                dataset_name=dataset_name,
+                aoi_name=aoi_name,
+                width_px=width_px,
+                height_px=height_px,
+                dpi=max(dpi, 1),
             )
         except Exception as fallback_exc:
             raise MapRenderError("map rendering failed") from fallback_exc
     finally:
-        overlay_duration_ms = int(
-            (time.perf_counter() - overlay_started) * 1000
-        )
+        duration_ms = int((time.perf_counter() - render_started) * 1000)
         logger.info(
             "Map render completed",
-            overlay_attempted=overlay_attempted,
-            overlay_used=overlay_used,
-            zoom=zoom,
-            tile_count_requested=tile_count_requested,
-            tile_count_success=tile_count_success,
-            overlay_duration_ms=overlay_duration_ms,
-            fallback_reason=fallback_reason,
+            basemap_attempted=basemap_metrics.get("attempted", False),
+            basemap_used=basemap_metrics.get("used", False),
+            basemap_reason=basemap_metrics.get("reason"),
+            mapbox_style_id=basemap_metrics.get(
+                "mapbox_style_id", _resolve_mapbox_style()
+            ),
+            mapbox_timeout_s=basemap_metrics.get(
+                "mapbox_timeout_s",
+                max(float(APISettings.mapbox_static_timeout_seconds), 0.1),
+            ),
+            overlay_attempted=overlay_metrics.get("attempted", False),
+            overlay_used=overlay_metrics.get("used", False),
+            overlay_reason=overlay_metrics.get("reason"),
+            zoom=overlay_metrics.get("zoom"),
+            tile_count_requested=overlay_metrics.get(
+                "tile_count_requested", 0
+            ),
+            tile_count_success=overlay_metrics.get("tile_count_success", 0),
+            basemap_duration_ms=basemap_metrics.get("duration_ms"),
+            overlay_duration_ms=overlay_metrics.get("duration_ms"),
+            render_duration_ms=duration_ms,
+            render_path=render_path,
         )

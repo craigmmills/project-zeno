@@ -4,6 +4,7 @@ import pytest
 from PIL import Image
 
 from src.api import map_renderer as mr
+from src.api.config import APISettings
 from src.api.map_renderer import (
     MAX_TILE_REQUESTS,
     MapRenderError,
@@ -30,6 +31,29 @@ GEOMETRY = {
 }
 
 
+@pytest.fixture(autouse=True)
+def reset_mapbox_settings():
+    old_access = APISettings.mapbox_access_token
+    old_api = APISettings.mapbox_api_token
+    old_style = APISettings.mapbox_style_id
+    old_timeout = APISettings.mapbox_static_timeout_seconds
+    old_scale = APISettings.mapbox_static_scale
+
+    APISettings.mapbox_access_token = "test-mapbox-token"
+    APISettings.mapbox_api_token = ""
+    APISettings.mapbox_style_id = "mapbox/outdoors-v12"
+    APISettings.mapbox_static_timeout_seconds = 2.5
+    APISettings.mapbox_static_scale = 2
+
+    yield
+
+    APISettings.mapbox_access_token = old_access
+    APISettings.mapbox_api_token = old_api
+    APISettings.mapbox_style_id = old_style
+    APISettings.mapbox_static_timeout_seconds = old_timeout
+    APISettings.mapbox_static_scale = old_scale
+
+
 async def test_render_map_png_with_polygon_returns_png_bytes():
     with patch(
         "src.api.map_renderer.get_geometry_data",
@@ -52,9 +76,180 @@ async def test_render_map_png_with_polygon_returns_png_bytes():
     assert png.startswith(b"\x89PNG")
 
 
-async def test_render_map_png_uses_dataset_tiles_when_available():
-    fake_tile = Image.new("RGBA", (256, 256), (255, 10, 10, 200))
+async def test_render_map_png_uses_basemap_and_overlay_when_both_available():
+    fake_tile = Image.new("RGBA", (256, 256), (255, 10, 10, 180))
+    fake_basemap = Image.new("RGBA", (512, 512), (30, 80, 120, 255))
 
+    with (
+        patch(
+            "src.api.map_renderer.get_geometry_data",
+            new=AsyncMock(
+                return_value={
+                    "name": "Test AOI",
+                    "geometry": GEOMETRY,
+                }
+            ),
+        ),
+        patch(
+            "src.api.map_renderer._download_mapbox_basemap",
+            new=AsyncMock(return_value=fake_basemap),
+        ) as download_basemap,
+        patch(
+            "src.api.map_renderer._download_tiles",
+            new=AsyncMock(return_value={(0, 0): fake_tile}),
+        ) as download_tiles,
+        patch(
+            "src.api.map_renderer._render_aoi_only_png",
+            wraps=mr._render_aoi_only_png,
+        ) as render_aoi_only,
+    ):
+        png = await render_map_png(
+            aoi={"source": "gadm", "src_id": "BRA"},
+            dataset={
+                "dataset_name": "Dataset",
+                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
+            },
+            width_px=512,
+            height_px=512,
+            dpi=120,
+        )
+
+    assert png.startswith(b"\x89PNG")
+    download_basemap.assert_awaited_once()
+    download_tiles.assert_awaited_once()
+    render_aoi_only.assert_not_called()
+
+
+async def test_render_map_png_mapbox_failure_uses_overlay_only_path():
+    fake_tile = Image.new("RGBA", (256, 256), (10, 40, 200, 180))
+
+    with (
+        patch(
+            "src.api.map_renderer.get_geometry_data",
+            new=AsyncMock(
+                return_value={
+                    "name": "Test AOI",
+                    "geometry": GEOMETRY,
+                }
+            ),
+        ),
+        patch(
+            "src.api.map_renderer._download_mapbox_basemap",
+            new=AsyncMock(return_value=None),
+        ) as download_basemap,
+        patch(
+            "src.api.map_renderer._download_tiles",
+            new=AsyncMock(return_value={(0, 0): fake_tile}),
+        ) as download_tiles,
+        patch(
+            "src.api.map_renderer._render_aoi_only_png",
+            wraps=mr._render_aoi_only_png,
+        ) as render_aoi_only,
+    ):
+        png = await render_map_png(
+            aoi={"source": "gadm", "src_id": "BRA"},
+            dataset={
+                "dataset_name": "Dataset",
+                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
+            },
+            width_px=800,
+            height_px=500,
+            dpi=120,
+        )
+
+    assert png.startswith(b"\x89PNG")
+    download_basemap.assert_awaited_once()
+    download_tiles.assert_awaited_once()
+    render_aoi_only.assert_not_called()
+
+
+async def test_render_map_png_overlay_failure_uses_basemap_only_path():
+    fake_basemap = Image.new("RGBA", (800, 500), (30, 80, 120, 255))
+
+    with (
+        patch(
+            "src.api.map_renderer.get_geometry_data",
+            new=AsyncMock(
+                return_value={
+                    "name": "Test AOI",
+                    "geometry": GEOMETRY,
+                }
+            ),
+        ),
+        patch(
+            "src.api.map_renderer._download_mapbox_basemap",
+            new=AsyncMock(return_value=fake_basemap),
+        ) as download_basemap,
+        patch(
+            "src.api.map_renderer._download_tiles",
+            new=AsyncMock(return_value={}),
+        ) as download_tiles,
+        patch(
+            "src.api.map_renderer._render_aoi_only_png",
+            wraps=mr._render_aoi_only_png,
+        ) as render_aoi_only,
+    ):
+        png = await render_map_png(
+            aoi={"source": "gadm", "src_id": "BRA"},
+            dataset={
+                "dataset_name": "Dataset",
+                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
+            },
+            width_px=800,
+            height_px=500,
+            dpi=120,
+        )
+
+    assert png.startswith(b"\x89PNG")
+    download_basemap.assert_awaited_once()
+    download_tiles.assert_awaited_once()
+    render_aoi_only.assert_not_called()
+
+
+async def test_render_map_png_both_fail_falls_back_to_matplotlib():
+    with (
+        patch(
+            "src.api.map_renderer.get_geometry_data",
+            new=AsyncMock(
+                return_value={
+                    "name": "Test AOI",
+                    "geometry": GEOMETRY,
+                }
+            ),
+        ),
+        patch(
+            "src.api.map_renderer._download_mapbox_basemap",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.api.map_renderer._download_tiles",
+            new=AsyncMock(return_value={}),
+        ),
+        patch(
+            "src.api.map_renderer._render_aoi_only_png",
+            wraps=mr._render_aoi_only_png,
+        ) as render_aoi_only,
+    ):
+        png = await render_map_png(
+            aoi={"source": "gadm", "src_id": "BRA"},
+            dataset={
+                "dataset_name": "Dataset",
+                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
+            },
+            width_px=800,
+            height_px=500,
+            dpi=120,
+        )
+
+    assert png.startswith(b"\x89PNG")
+    assert render_aoi_only.call_count == 1
+
+
+async def test_render_map_png_missing_mapbox_token_still_returns_image():
+    APISettings.mapbox_access_token = ""
+    APISettings.mapbox_api_token = ""
+
+    fake_tile = Image.new("RGBA", (256, 256), (10, 40, 200, 180))
     with (
         patch(
             "src.api.map_renderer.get_geometry_data",
@@ -83,101 +278,6 @@ async def test_render_map_png_uses_dataset_tiles_when_available():
 
     assert png.startswith(b"\x89PNG")
     download_tiles.assert_awaited_once()
-
-
-async def test_render_map_png_missing_tile_url_returns_aoi_only_png():
-    with (
-        patch(
-            "src.api.map_renderer.get_geometry_data",
-            new=AsyncMock(
-                return_value={
-                    "name": "Test AOI",
-                    "geometry": GEOMETRY,
-                }
-            ),
-        ),
-        patch(
-            "src.api.map_renderer._download_tiles",
-            new=AsyncMock(),
-        ) as download_tiles,
-    ):
-        png = await render_map_png(
-            aoi={"source": "gadm", "src_id": "BRA"},
-            dataset={"dataset_name": "Dataset"},
-            width_px=800,
-            height_px=500,
-            dpi=120,
-        )
-
-    assert png.startswith(b"\x89PNG")
-    download_tiles.assert_not_called()
-
-
-async def test_render_map_png_all_tile_fetch_failures_fall_back_to_aoi_only():
-    with (
-        patch(
-            "src.api.map_renderer.get_geometry_data",
-            new=AsyncMock(
-                return_value={
-                    "name": "Test AOI",
-                    "geometry": GEOMETRY,
-                }
-            ),
-        ),
-        patch(
-            "src.api.map_renderer._download_tiles",
-            new=AsyncMock(return_value={}),
-        ),
-        patch(
-            "src.api.map_renderer._render_aoi_only_png",
-            wraps=mr._render_aoi_only_png,
-        ) as render_aoi_only,
-    ):
-        png = await render_map_png(
-            aoi={"source": "gadm", "src_id": "BRA"},
-            dataset={
-                "dataset_name": "Dataset",
-                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
-            },
-            width_px=800,
-            height_px=500,
-            dpi=120,
-        )
-
-    assert png.startswith(b"\x89PNG")
-    assert render_aoi_only.call_count == 1
-
-
-async def test_render_map_png_partial_tile_failures_still_returns_png():
-    fake_tile = Image.new("RGBA", (256, 256), (10, 40, 200, 180))
-
-    with (
-        patch(
-            "src.api.map_renderer.get_geometry_data",
-            new=AsyncMock(
-                return_value={
-                    "name": "Test AOI",
-                    "geometry": GEOMETRY,
-                }
-            ),
-        ),
-        patch(
-            "src.api.map_renderer._download_tiles",
-            new=AsyncMock(return_value={(0, 0): fake_tile}),
-        ),
-    ):
-        png = await render_map_png(
-            aoi={"source": "gadm", "src_id": "BRA"},
-            dataset={
-                "dataset_name": "Dataset",
-                "tile_url": "https://tiles.example.com/{z}/{x}/{y}.png",
-            },
-            width_px=800,
-            height_px=500,
-            dpi=120,
-        )
-
-    assert png.startswith(b"\x89PNG")
 
 
 def test_render_map_png_caps_tile_requests_by_reducing_zoom():
