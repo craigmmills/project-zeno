@@ -79,7 +79,7 @@ class _APISettings(BaseSettings):
     mapbox_access_token: str = Field(default="", alias="MAPBOX_ACCESS_TOKEN")
     mapbox_api_token: str = Field(default="", alias="MAPBOX_API_TOKEN")
     mapbox_style_id: str = Field(
-        default="mapbox/outdoors-v12", alias="MAPBOX_STYLE_ID"
+        default="mapbox/dark-v11", alias="MAPBOX_STYLE_ID"
     )
     mapbox_static_timeout_seconds: float = Field(
         default=2.5, alias="MAPBOX_STATIC_TIMEOUT_SECONDS"

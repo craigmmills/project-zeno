@@ -24,7 +24,7 @@ MERCATOR_MAX_LAT = 85.05112878
 
 MAPBOX_STATIC_BASE_URL = "https://api.mapbox.com/styles/v1"
 MAPBOX_MAX_DIMENSION = 1280
-MAPBOX_DEFAULT_STYLE = "mapbox/outdoors-v12"
+MAPBOX_DEFAULT_STYLE = "mapbox/dark-v11"
 
 
 class MapRenderError(Exception):
@@ -289,7 +289,9 @@ async def _download_mapbox_basemap(
 
     timeout = httpx.Timeout(timeout_s)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True
+        ) as client:
             response = await client.get(url)
         response.raise_for_status()
     except Exception:
@@ -354,7 +356,9 @@ async def _download_tiles(
             return (x, y), None
 
     tiles: dict[tuple[int, int], Image.Image] = {}
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True
+    ) as client:
         tasks = [
             asyncio.create_task(_fetch_tile(client=client, x=x, y=y))
             for y in y_range
@@ -399,16 +403,17 @@ def _crop_mosaic_to_bounds(
     z: int,
     x_min: int,
     y_min: int,
+    tile_size: int = TILE_SIZE,
 ) -> Image.Image:
     min_lon, min_lat, max_lon, max_lat = bounds4326
 
     tx_w, ty_n = _lonlat_to_tile_xy(min_lon, max_lat, z)
     tx_e, ty_s = _lonlat_to_tile_xy(max_lon, min_lat, z)
 
-    left = int((tx_w - x_min) * TILE_SIZE)
-    right = int((tx_e - x_min) * TILE_SIZE)
-    top = int((ty_n - y_min) * TILE_SIZE)
-    bottom = int((ty_s - y_min) * TILE_SIZE)
+    left = int((tx_w - x_min) * tile_size)
+    right = int((tx_e - x_min) * tile_size)
+    top = int((ty_n - y_min) * tile_size)
+    bottom = int((ty_s - y_min) * tile_size)
 
     left = max(0, min(left, mosaic.width - 1))
     right = max(left + 1, min(right, mosaic.width))
@@ -528,6 +533,8 @@ async def _render_data_overlay_image(
     bounds: tuple[float, float, float, float],
     width_px: int,
     height_px: int,
+    zoom: Optional[int] = None,
+    tile_grid_result: Optional[tuple[int, int, int, int]] = None,
 ) -> tuple[Optional[Image.Image], dict[str, Any]]:
     started = time.perf_counter()
     metrics: dict[str, Any] = {
@@ -548,15 +555,19 @@ async def _render_data_overlay_image(
     try:
         metrics["attempted"] = True
         tile_template = _normalize_xyz_template(tile_template)
-        zoom = _pick_zoom(
-            bounds4326=bounds,
-            width_px=width_px,
-            height_px=height_px,
-            max_zoom=DEFAULT_MAX_ZOOM,
-        )
+        if zoom is None:
+            zoom = _pick_zoom(
+                bounds4326=bounds,
+                width_px=width_px,
+                height_px=height_px,
+                max_zoom=DEFAULT_MAX_ZOOM,
+            )
         metrics["zoom"] = zoom
 
-        x_min, x_max, y_min, y_max = _tile_grid(bounds, zoom)
+        if tile_grid_result is not None:
+            x_min, x_max, y_min, y_max = tile_grid_result
+        else:
+            x_min, x_max, y_min, y_max = _tile_grid(bounds, zoom)
         metrics["tile_count_requested"] = (x_max - x_min + 1) * (
             y_max - y_min + 1
         )
@@ -614,15 +625,29 @@ async def _render_data_overlay_image(
         return None, metrics
 
 
+def _build_mapbox_tile_template(
+    style_id: str, token: str, scale: int
+) -> str:
+    scale_suffix = "@2x" if scale == 2 else ""
+    return (
+        f"https://api.mapbox.com/styles/v1/{style_id}"
+        f"/tiles/256/{{z}}/{{x}}/{{y}}{scale_suffix}"
+        f"?access_token={token}"
+    )
+
+
 async def _render_basemap_image(
     bounds: tuple[float, float, float, float],
     width_px: int,
     height_px: int,
+    zoom: Optional[int] = None,
+    tile_grid_result: Optional[tuple[int, int, int, int]] = None,
 ) -> tuple[Optional[Image.Image], dict[str, Any]]:
     started = time.perf_counter()
     token = _resolve_mapbox_token()
     style_id = _resolve_mapbox_style()
     timeout_s = max(float(APISettings.mapbox_static_timeout_seconds), 0.1)
+    scale = APISettings.mapbox_static_scale
 
     metrics: dict[str, Any] = {
         "attempted": bool(token),
@@ -637,19 +662,79 @@ async def _render_basemap_image(
         metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
         return None, metrics
 
-    basemap = await _download_mapbox_basemap(
-        bounds4326=bounds,
-        width_px=width_px,
-        height_px=height_px,
-    )
-    if basemap is None:
-        metrics["reason"] = "mapbox_fetch_failed"
-        metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        return None, metrics
+    try:
+        if zoom is None:
+            zoom = _pick_zoom(
+                bounds4326=bounds,
+                width_px=width_px,
+                height_px=height_px,
+                max_zoom=DEFAULT_MAX_ZOOM,
+            )
 
-    metrics["used"] = True
-    metrics["duration_ms"] = int((time.perf_counter() - started) * 1000)
-    return basemap, metrics
+        if tile_grid_result is None:
+            tile_grid_result = _tile_grid(bounds, zoom)
+
+        x_min, x_max, y_min, y_max = tile_grid_result
+        tile_template = _build_mapbox_tile_template(
+            style_id=style_id,
+            token=token,
+            scale=max(1, min(scale, 2)),
+        )
+
+        tiles = await _download_tiles(
+            url_template=tile_template,
+            z=zoom,
+            x_range=range(x_min, x_max + 1),
+            y_range=range(y_min, y_max + 1),
+            timeout_s=timeout_s,
+            concurrency=MAX_TILE_CONCURRENCY,
+        )
+
+        if not tiles:
+            metrics["reason"] = "mapbox_tile_fetch_failed"
+            metrics["duration_ms"] = int(
+                (time.perf_counter() - started) * 1000
+            )
+            return None, metrics
+
+        resolved_tile_size = TILE_SIZE * max(1, min(scale, 2))
+        mosaic = _compose_mosaic(
+            tiles=tiles,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            tile_size=resolved_tile_size,
+        )
+        cropped = _crop_mosaic_to_bounds(
+            mosaic=mosaic,
+            bounds4326=bounds,
+            z=zoom,
+            x_min=x_min,
+            y_min=y_min,
+            tile_size=resolved_tile_size,
+        )
+        basemap = cropped.resize(
+            (max(width_px, 1), max(height_px, 1)),
+            Image.Resampling.BILINEAR,
+        )
+
+        metrics["used"] = True
+        metrics["duration_ms"] = int(
+            (time.perf_counter() - started) * 1000
+        )
+        return basemap, metrics
+    except Exception as exc:
+        logger.warning(
+            "Basemap tile fetch failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        metrics["reason"] = "mapbox_exception"
+        metrics["duration_ms"] = int(
+            (time.perf_counter() - started) * 1000
+        )
+        return None, metrics
 
 
 async def render_map_png(
@@ -688,18 +773,30 @@ async def render_map_png(
     overlay_metrics: dict[str, Any] = {}
     render_path = "aoi_only_matplotlib"
 
+    zoom = _pick_zoom(
+        bounds4326=bounds,
+        width_px=width_px,
+        height_px=height_px,
+        max_zoom=DEFAULT_MAX_ZOOM,
+    )
+    grid = _tile_grid(bounds, zoom)
+
     try:
         (basemap_result, overlay_result) = await asyncio.gather(
             _render_basemap_image(
                 bounds=bounds,
                 width_px=width_px,
                 height_px=height_px,
+                zoom=zoom,
+                tile_grid_result=grid,
             ),
             _render_data_overlay_image(
                 dataset=dataset,
                 bounds=bounds,
                 width_px=width_px,
                 height_px=height_px,
+                zoom=zoom,
+                tile_grid_result=grid,
             ),
         )
         basemap_image, basemap_metrics = basemap_result
