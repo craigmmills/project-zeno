@@ -1,0 +1,9 @@
+{
+  "repo": "project-zeno",
+  "issue_number": 7,
+  "issue_title": "Fix markdown formatting in Telegram messages",
+  "slug": "7-fix-markdown-formatting-in-telegram-messages",
+  "created_at": "2026-02-11T02:28:52Z",
+  "session_backend": "tmux",
+  "session_name": "project-zeno_specs_7-fix-markdown-formatting-in-telegram-messages_pi"
+}

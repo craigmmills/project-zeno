@@ -619,6 +619,33 @@ def _build_telegram_map_caption(context: Dict[str, Any]) -> str:
     return caption or "Map"
 
 
+def _fallback_chart_label(chart_type: Any) -> str:
+    chart_type_key = str(chart_type or "").strip().lower()
+    chart_labels = {
+        "line": "Line chart",
+        "area": "Area chart",
+        "scatter": "Scatter chart",
+        "bar": "Bar chart",
+        "stacked-bar": "Stacked bar chart",
+        "grouped-bar": "Grouped bar chart",
+        "pie": "Pie chart",
+    }
+    return chart_labels.get(chart_type_key, "Chart")
+
+
+def _build_telegram_chart_caption(chart: Dict[str, Any]) -> str:
+    title = str(chart.get("title") or "").strip()
+    label = title or _fallback_chart_label(chart.get("type"))
+
+    caption = re.sub(r"\s+", " ", label).strip()
+    caption = caption[: APISettings.lite_chart_caption_max_chars].strip()
+
+    if not caption:
+        return "Chart"
+
+    return caption
+
+
 async def _send_telegram_typing(bot_token: str, chat_id: int):
     """Send 'typing...' indicator to the user."""
     url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
@@ -958,8 +985,12 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                 chart_render_ms = int(
                     (time.perf_counter() - chart_started) * 1000
                 )
-                caption = str(selected_chart.get("insight") or "")
-                caption = caption[: APISettings.lite_chart_caption_max_chars]
+                caption = _build_telegram_chart_caption(selected_chart)
+                chart_caption_source = (
+                    "title"
+                    if str(selected_chart.get("title") or "").strip()
+                    else "fallback"
+                )
 
                 await _send_telegram_photo(
                     bot_token=APISettings.telegram_bot_token,
@@ -976,6 +1007,8 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                     interaction_status="ok",
                     interaction_token_present=True,
                     chart_render_ms=chart_render_ms,
+                    chart_caption_source=chart_caption_source,
+                    chart_caption_length=len(caption),
                     update_id=update_id,
                 )
                 _telegram_update_cache[update_id] = "done"
@@ -1132,20 +1165,20 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
             user_id=user_id,
         )
         final_text = result.get("text") or ""
-        parts = _split_text_for_telegram(
-            final_text,
-            max_chars=APISettings.lite_telegram_message_char_limit,
-        )
-
-        for part in parts:
-            await _send_telegram_message(
-                bot_token=APISettings.telegram_bot_token,
-                chat_id=parsed["chat_id"],
-                text=part,
-                message_thread_id=parsed["message_thread_id"],
-            )
 
         if APISettings.lite_telegram_enable_map_buttons:
+            parts = _split_text_for_telegram(
+                final_text,
+                max_chars=APISettings.lite_telegram_message_char_limit,
+            )
+
+            for part in parts:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text=part,
+                    message_thread_id=parsed["message_thread_id"],
+                )
             has_chart_candidate = _has_chart_candidate(
                 result.get("charts_data")
             )
@@ -1216,6 +1249,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
         chart_render_ms = 0
         chart_send_ms = 0
         chart_payload = result.get("charts_data") or []
+        chart_sent = False
 
         if not APISettings.lite_telegram_enable_charts:
             logger.info(
@@ -1327,10 +1361,12 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                         selector_debug=selector_debug_small,
                     )
                 else:
-                    caption = str(selected_chart.get("insight") or "")
-                    caption = caption[
-                        : APISettings.lite_chart_caption_max_chars
-                    ]
+                    caption = _build_telegram_chart_caption(selected_chart)
+                    chart_caption_source = (
+                        "title"
+                        if str(selected_chart.get("title") or "").strip()
+                        else "fallback"
+                    )
 
                     try:
                         chart_send_started = time.perf_counter()
@@ -1344,6 +1380,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                         chart_send_ms = int(
                             (time.perf_counter() - chart_send_started) * 1000
                         )
+                        chart_sent = True
                         logger.info(
                             "Telegram chart sent",
                             platform="telegram",
@@ -1355,6 +1392,8 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                             chart_select_ms=chart_select_ms,
                             chart_render_ms=chart_render_ms,
                             chart_send_ms=chart_send_ms,
+                            chart_caption_source=chart_caption_source,
+                            chart_caption_length=len(caption),
                             selector_debug=selector_debug_small,
                         )
                     except Exception:
@@ -1371,6 +1410,20 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
                             chart_send_ms=chart_send_ms,
                             selector_debug=selector_debug_small,
                         )
+
+        text_suppressed_for_chart_only = chart_sent
+        if not chart_sent:
+            parts = _split_text_for_telegram(
+                final_text,
+                max_chars=APISettings.lite_telegram_message_char_limit,
+            )
+            for part in parts:
+                await _send_telegram_message(
+                    bot_token=APISettings.telegram_bot_token,
+                    chat_id=parsed["chat_id"],
+                    text=part,
+                    message_thread_id=parsed["message_thread_id"],
+                )
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
@@ -1390,6 +1443,7 @@ async def _process_telegram_update(update_id: int, parsed: Dict[str, Any]):
             no_data_text=_is_probable_no_data_response(
                 result.get("text") or ""
             ),
+            text_suppressed_for_chart_only=text_suppressed_for_chart_only,
         )
 
     except Exception as e:

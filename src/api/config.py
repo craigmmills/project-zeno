@@ -62,7 +62,7 @@ class _APISettings(BaseSettings):
         default=100000, alias="LITE_TELEGRAM_INTERACTION_CACHE_SIZE"
     )
     lite_chart_caption_max_chars: int = Field(
-        default=1024, alias="LITE_CHART_CAPTION_MAX_CHARS"
+        default=80, alias="LITE_CHART_CAPTION_MAX_CHARS"
     )
     lite_map_caption_max_chars: int = Field(
         default=80, alias="LITE_MAP_CAPTION_MAX_CHARS"
